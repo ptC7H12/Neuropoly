@@ -49,6 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--markets", type=str, help="Path to markets data")
     parser.add_argument("--trades-format", type=str, choices=["csv", "parquet", "sqlite"])
     parser.add_argument("--markets-format", type=str, choices=["csv", "parquet", "sqlite"])
+    parser.add_argument("--sqlite-path", type=str, help="SQLite DB path (if both tables in same DB)")
+    parser.add_argument("--trades-table", type=str, help="SQLite table name for trades")
+    parser.add_argument("--markets-table", type=str, help="SQLite table name for markets")
     parser.add_argument("--bucket-minutes", type=int, help="Bucket size in minutes")
     parser.add_argument("--forward-window", type=int, help="Label forward window (buckets)")
     parser.add_argument("--learning-rate", type=float)
@@ -74,6 +77,12 @@ def apply_args(cfg: PipelineConfig, args: argparse.Namespace) -> PipelineConfig:
         cfg.data.trades_format = args.trades_format
     if args.markets_format:
         cfg.data.markets_format = args.markets_format
+    if args.sqlite_path:
+        cfg.data.sqlite_path = args.sqlite_path
+    if args.trades_table:
+        cfg.data.trades_table = args.trades_table
+    if args.markets_table:
+        cfg.data.markets_table = args.markets_table
     if args.bucket_minutes:
         cfg.bucket.bucket_minutes = args.bucket_minutes
     if args.forward_window:
