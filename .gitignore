@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+model.txt
+training_log.jsonl
+data/
+*.sqlite
+*.db
+.env
