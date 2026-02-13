@@ -14,6 +14,7 @@ def aggregate_trades(
 ) -> pl.DataFrame:
     """
     Aggregate raw trades into 5-minute buckets per market.
+    Uses Polars streaming engine to minimize RAM.
 
     Returns a DataFrame with one row per (market_id, bucket_time) containing:
     - trade_count, total_usd, total_tokens
@@ -35,24 +36,17 @@ def aggregate_trades(
 
     # Aggregate per (market_id, bucket_time)
     agg_exprs = [
-        # Counts
         pl.len().alias("trade_count"),
         pl.col("usd_amount").sum().alias("total_usd"),
         pl.col("token_amount").sum().alias("total_tokens"),
-        # Price stats
         pl.col("price").first().alias("open_price"),
         pl.col("price").last().alias("close_price"),
         pl.col("price").max().alias("high_price"),
         pl.col("price").min().alias("low_price"),
         pl.col("price").mean().alias("mean_price"),
-        # VWAP: sum(price * usd) / sum(usd)
         (pl.col("price") * pl.col("usd_amount")).sum().alias("_price_x_usd"),
-        # YES/NO ratio
         pl.col("is_yes").mean().alias("yes_ratio"),
-        # Whale trades
-        (pl.col("usd_amount") > cfg.whale_threshold_usd)
-        .sum()
-        .alias("whale_count"),
+        (pl.col("usd_amount") > cfg.whale_threshold_usd).sum().alias("whale_count"),
         pl.col("usd_amount")
         .filter(pl.col("usd_amount") > cfg.whale_threshold_usd)
         .sum()
@@ -63,11 +57,13 @@ def aggregate_trades(
     if "is_buy" in trades_bucketed.collect_schema().names():
         agg_exprs.append(pl.col("is_buy").mean().alias("buy_ratio"))
 
+    # Use Polars streaming backend for memory efficiency
     bucketed = (
         trades_bucketed.group_by(["market_id", "bucket_time"])
         .agg(agg_exprs)
         .sort(["market_id", "bucket_time"])
-    ).collect()
+        .collect(streaming=True)  # Streaming backend processes in chunks
+    )
 
     # Compute VWAP
     bucketed = bucketed.with_columns(

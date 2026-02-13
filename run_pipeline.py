@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, help="Monitor update interval")
     parser.add_argument("--no-rich", action="store_true", help="Disable rich dashboard")
     parser.add_argument("--dry-run", action="store_true", help="Stats only, no training")
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        help="Ultra-low memory mode: disable cross-market features, use streaming",
+    )
     return parser.parse_args()
 
 
@@ -101,6 +106,18 @@ def apply_args(cfg: PipelineConfig, args: argparse.Namespace) -> PipelineConfig:
         cfg.monitor.log_interval = args.log_interval
     if args.no_rich:
         cfg.monitor.rich_dashboard = False
+
+    # Low-memory mode optimizations
+    if hasattr(args, "low_memory") and args.low_memory:
+        cfg.features.cross_market_features = False
+        cfg.features.lag_buckets = [1, 3, 6]
+        cfg.features.rolling_windows = [6, 12]
+        cfg.model.num_leaves = 15
+        cfg.model.max_depth = 5
+        print("  ⚠️  Low-memory mode enabled:")
+        print("     - Cross-market features disabled")
+        print("     - Reduced feature sets")
+        print("     - Smaller model (num_leaves=15, max_depth=5)")
 
     return cfg
 
