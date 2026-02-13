@@ -20,12 +20,12 @@ def load_trades(cfg: DataConfig) -> pl.LazyFrame:
     elif cfg.trades_format == "parquet":
         lf = pl.scan_parquet(cfg.trades_path)
     elif cfg.trades_format == "sqlite":
-        # SQLite: read into memory, then convert to lazy
-        # Use sqlite_path if set, otherwise fall back to trades_path
         import sqlite3
 
         db_path = cfg.sqlite_path or cfg.trades_path
         conn = sqlite3.connect(db_path)
+
+        # read_database loads everything eagerly — wrap as lazy for uniform API
         df = pl.read_database(
             f"SELECT * FROM {cfg.trades_table}", conn
         )
@@ -55,6 +55,7 @@ def load_markets(cfg: DataConfig) -> pl.LazyFrame:
 
         db_path = cfg.sqlite_path or cfg.markets_path
         conn = sqlite3.connect(db_path)
+
         df = pl.read_database(
             f"SELECT * FROM {cfg.markets_table}", conn
         )

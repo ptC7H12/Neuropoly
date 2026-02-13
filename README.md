@@ -274,8 +274,29 @@ Misst wie gut die vorhergesagten Wahrscheinlichkeiten kalibriert sind. Wenn das 
 
 ## Tipps
 
+### RAM-Verbrauch senken
+
+Bei >20GB RAM-Verbrauch nutze **Ultra-Low-Memory-Mode**:
+
+```bash
+python run_pipeline.py --low-memory \
+  --trades data/trades.parquet --trades-format parquet \
+  --markets data/markets.csv \
+  --bucket-minutes 10 \
+  --n-jobs 4
+```
+
+Das reduziert RAM auf **3-5 GB** durch:
+- Deaktivierung von Cross-Market-Features
+- Reduzierte Lag/Rolling-Windows (5 → 2-3 Features statt 93)
+- Kleineres Modell (num_leaves=15, max_depth=5)
+- Polars Streaming-Backend (verarbeitet in Chunks)
+- 10-Min-Buckets statt 5-Min (50% weniger Zeilen)
+
+### Allgemeine Tipps
+
 - **Erster Lauf**: Nutze `--dry-run` um die Daten-Statistiken zu pruefen bevor du trainierst
-- **Wenig RAM**: Nutze Parquet statt CSV (schneller, kleiner)
+- **Datenformat**: Parquet >> CSV >> SQLite (RAM-weise)
 - **Langsames Training**: Reduziere `--num-leaves` oder `--max-depth`
 - **Overfitting**: Wenn Train-AUC >> Val-AUC, erhoehe `min_child_samples` in `config.py`
 - **Modell laden**: Nach dem Training liegt das Modell in `model.txt` und kann wiederverwendet werden
