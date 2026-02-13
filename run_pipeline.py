@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--num-leaves", type=int)
     parser.add_argument("--max-depth", type=int)
-    parser.add_argument("--n-jobs", type=int, default=10)
+    parser.add_argument("--n-jobs", type=int, default=None)
     parser.add_argument("--entry-threshold", type=float, help="Backtest entry threshold")
     parser.add_argument("--model-path", type=str, default="model.txt", help="Save path")
     parser.add_argument("--log-interval", type=int, help="Monitor update interval")
@@ -108,7 +108,7 @@ def apply_args(cfg: PipelineConfig, args: argparse.Namespace) -> PipelineConfig:
         cfg.monitor.rich_dashboard = False
 
     # Low-memory mode optimizations
-    if hasattr(args, "low_memory") and args.low_memory:
+    if args.low_memory:
         cfg.features.cross_market_features = False
         cfg.features.lag_buckets = [1, 3, 6]
         cfg.features.rolling_windows = [6, 12]

@@ -20,27 +20,17 @@ def load_trades(cfg: DataConfig) -> pl.LazyFrame:
     elif cfg.trades_format == "parquet":
         lf = pl.scan_parquet(cfg.trades_path)
     elif cfg.trades_format == "sqlite":
-        # SQLite: try scan_database first (Polars 0.20.31+), fall back to read_database
         import sqlite3
 
         db_path = cfg.sqlite_path or cfg.trades_path
         conn = sqlite3.connect(db_path)
 
-        # Try to use scan_database for streaming (Polars 1.0+)
-        try:
-            lf = pl.scan_database(
-                query=f"SELECT * FROM {cfg.trades_table}",
-                connection=conn,
-                infer_schema_length=10000,
-            )
-        except AttributeError:
-            # Fallback: use read_database (loads to memory but still a LazyFrame)
-            df = pl.read_database(
-                f"SELECT * FROM {cfg.trades_table}", conn
-            )
-            lf = df.lazy()
-
+        # read_database loads everything eagerly — wrap as lazy for uniform API
+        df = pl.read_database(
+            f"SELECT * FROM {cfg.trades_table}", conn
+        )
         conn.close()
+        lf = df.lazy()
     else:
         raise ValueError(f"Unsupported trades format: {cfg.trades_format}")
 
@@ -66,21 +56,11 @@ def load_markets(cfg: DataConfig) -> pl.LazyFrame:
         db_path = cfg.sqlite_path or cfg.markets_path
         conn = sqlite3.connect(db_path)
 
-        # Try to use scan_database for streaming (Polars 1.0+), fall back to read_database
-        try:
-            lf = pl.scan_database(
-                query=f"SELECT * FROM {cfg.markets_table}",
-                connection=conn,
-                infer_schema_length=5000,
-            )
-        except AttributeError:
-            # Fallback: use read_database
-            df = pl.read_database(
-                f"SELECT * FROM {cfg.markets_table}", conn
-            )
-            lf = df.lazy()
-
+        df = pl.read_database(
+            f"SELECT * FROM {cfg.markets_table}", conn
+        )
         conn.close()
+        lf = df.lazy()
     else:
         raise ValueError(f"Unsupported markets format: {cfg.markets_format}")
 
