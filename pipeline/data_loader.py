@@ -19,17 +19,13 @@ def load_trades(cfg: DataConfig) -> pl.LazyFrame:
         )
     elif cfg.trades_format == "parquet":
         lf = pl.scan_parquet(cfg.trades_path)
+        
     elif cfg.trades_format == "sqlite":
-        import sqlite3
-
         db_path = cfg.sqlite_path or cfg.trades_path
-        conn = sqlite3.connect(db_path)
-
-        # read_database loads everything eagerly — wrap as lazy for uniform API
-        lf = pl.scan_sql(
+        lf = pl.read_database_uri(
             f"SELECT * FROM {cfg.trades_table}",
-            connection_uri=f"sqlite:///{db_path}"
-        )
+            uri=f"sqlite:///{db_path}"
+        ).lazy()
 
     else:
         raise ValueError(f"Unsupported trades format: {cfg.trades_format}")
@@ -52,10 +48,10 @@ def load_markets(cfg: DataConfig) -> pl.LazyFrame:
         lf = pl.scan_parquet(cfg.markets_path)
     elif cfg.markets_format == "sqlite":
         db_path = cfg.sqlite_path or cfg.markets_path
-        lf = pl.scan_sql(
+        lf = pl.read_database_uri(
             f"SELECT * FROM {cfg.markets_table}",
-            connection_uri=f"sqlite:///{db_path}"
-        )
+            uri=f"sqlite:///{db_path}"
+        ).lazy()
 
     else:
         raise ValueError(f"Unsupported markets format: {cfg.markets_format}")
