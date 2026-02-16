@@ -135,11 +135,11 @@ def _normalize_markets(lf: pl.LazyFrame) -> pl.LazyFrame:
         lf = lf.rename(rename_map)
 
     lf = lf.with_columns(
-        pl.col("market_id").cast(pl.Int64),
-        pl.col("yes_price").cast(pl.Float64),
-        pl.col("no_price").cast(pl.Float64),
-        pl.col("volume").cast(pl.Float64),
-        pl.col("liquidity").cast(pl.Float64),
+        pl.col("market_id").cast(pl.Int32),
+        pl.col("yes_price").cast(pl.Float32),
+        pl.col("no_price").cast(pl.Float32),
+        pl.col("volume").cast(pl.Float32),
+        pl.col("liquidity").cast(pl.Float32),
     )
 
     return lf
