@@ -1,9 +1,14 @@
 """
 Trade aggregation into fixed-size time buckets per market.
 Produces bucketed trade statistics (OHLC-style + volume metrics).
+
+MEMORY OPTIMIZED:
+- No .collect()
+- Writes directly to Parquet via sink_parquet
 """
 
 import polars as pl
+from pathlib import Path
 
 from config import BucketConfig
 
@@ -11,21 +16,17 @@ from config import BucketConfig
 def aggregate_trades(
     trades: pl.LazyFrame,
     cfg: BucketConfig,
-) -> pl.DataFrame:
+    output_path: str = "bucketed.parquet",
+) -> str:
     """
-    Aggregate raw trades into 5-minute buckets per market.
-    Uses Polars streaming engine to minimize RAM.
+    Aggregate raw trades into time buckets per market.
 
-    Returns a DataFrame with one row per (market_id, bucket_time) containing:
-    - trade_count, total_usd, total_tokens
-    - open_price, close_price, high_price, low_price
-    - mean_price, vwap (volume-weighted average price)
-    - buy_ratio (fraction of YES trades)
-    - whale_count, whale_usd (trades > whale threshold)
-    - momentum (close - open price change)
+    Instead of returning a DataFrame (RAM heavy),
+    this function writes directly to a Parquet file and returns the file path.
     """
 
     bucket_dur = f"{cfg.bucket_minutes}m"
+    output_path = str(Path(output_path))
 
     # Truncate timestamp to bucket boundary
     trades_bucketed = trades.with_columns(
@@ -34,7 +35,7 @@ def aggregate_trades(
         .alias("bucket_time"),
     )
 
-    # Aggregate per (market_id, bucket_time)
+    # Aggregation expressions
     agg_exprs = [
         pl.len().alias("trade_count"),
         pl.col("usd_amount").sum().alias("total_usd"),
@@ -53,34 +54,39 @@ def aggregate_trades(
         .alias("whale_usd"),
     ]
 
-    # Add buy ratio if is_buy column exists
+    # Optional buy ratio
     if "is_buy" in trades_bucketed.collect_schema().names():
         agg_exprs.append(pl.col("is_buy").mean().alias("buy_ratio"))
 
-    # Use Polars streaming backend for memory efficiency
-    bucketed = (
-        trades_bucketed.group_by(["market_id", "bucket_time"])
+    # Build lazy aggregation
+    bucketed_lazy = (
+        trades_bucketed
+        .group_by(["market_id", "bucket_time"])
         .agg(agg_exprs)
         .sort(["market_id", "bucket_time"])
-        .collect(streaming=True)  # Streaming backend processes in chunks
     )
 
-    # Compute VWAP
-    bucketed = bucketed.with_columns(
+    # VWAP
+    bucketed_lazy = bucketed_lazy.with_columns(
         (pl.col("_price_x_usd") / pl.col("total_usd"))
         .fill_nan(None)
         .alias("vwap"),
     ).drop("_price_x_usd")
 
-    # Momentum = close - open
-    bucketed = bucketed.with_columns(
+    # Momentum
+    bucketed_lazy = bucketed_lazy.with_columns(
         (pl.col("close_price") - pl.col("open_price")).alias("momentum"),
     )
 
-    # Fill null whale_usd with 0
-    bucketed = bucketed.with_columns(
+    # Fill nulls
+    bucketed_lazy = bucketed_lazy.with_columns(
         pl.col("whale_usd").fill_null(0.0),
         pl.col("whale_count").fill_null(0),
     )
 
-    return bucketed
+    # IMPORTANT: write directly to disk instead of collect
+    bucketed_lazy.sink_parquet(output_path)
+
+    print(f"  Bucketed data written to: {output_path}")
+
+    return output_path
