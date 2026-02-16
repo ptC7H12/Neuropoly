@@ -143,7 +143,8 @@ def main():
 
     # ── Step 2: Aggregate into buckets ─────────────────────────
     print(f"\n[2/8] Aggregating trades into {cfg.bucket.bucket_minutes}-min buckets...")
-    bucketed = aggregate_trades(trades_lf, cfg.bucket)
+    bucketed_path = aggregate_trades(trades_lf, cfg.bucket)
+    bucketed = pl.scan_parquet(bucketed_path).collect(streaming=True)
     n_markets = bucketed["market_id"].n_unique()
     print(f"  Bucketed: {bucketed.height} rows across {n_markets} markets")
 
