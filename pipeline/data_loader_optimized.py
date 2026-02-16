@@ -1,6 +1,7 @@
 """
 Data loading for trades and markets.
 Supports CSV, Parquet, and SQLite sources.
+MEMORY OPTIMIZED: Uses streaming conversion for large SQLite databases.
 """
 
 import polars as pl
@@ -22,7 +23,7 @@ def load_trades(cfg: DataConfig) -> pl.LazyFrame:
         lf = pl.scan_parquet(cfg.trades_path)
         
     elif cfg.trades_format == "sqlite":
-        # MEMORY-OPTIMIZED: Convert to Parquet if not already done
+        # MEMORY-OPTIMIZED: Convert to Parquet with streaming if not already done
         import sqlite3
         
         db_path = cfg.sqlite_path or cfg.trades_path
@@ -34,59 +35,14 @@ def load_trades(cfg: DataConfig) -> pl.LazyFrame:
         if not parquet_path.exists():
             print(f"  ⚠️  Parquet file not found: {parquet_path}")
             print(f"  Converting SQLite to Parquet (one-time operation)...")
-            print(f"  This will improve memory efficiency for future runs.")
+            print(f"  Using streaming mode for minimal RAM usage.")
             print()
             
-            conn = sqlite3.connect(str(db_path))
-            
-            # Get total row count for progress tracking
-            try:
-                cursor = conn.cursor()
-                cursor.execute(f"SELECT COUNT(*) FROM {cfg.trades_table}")
-                total_rows = cursor.fetchone()[0]
-                print(f"  Total rows to convert: {total_rows:,}")
-            except Exception:
-                total_rows = None
-            
-            # Read in chunks, collect them, then write once
-            chunk_size = 5_000_000  # 5M rows per chunk
-            offset = 0
-            chunk_num = 0
-            chunks = []
-            
-            while True:
-                query = f"SELECT * FROM {cfg.trades_table} LIMIT {chunk_size} OFFSET {offset}"
-                chunk = pl.read_database(query, connection=conn)
-                
-                if chunk.height == 0:
-                    break
-                
-                chunks.append(chunk)
-                
-                chunk_num += 1
-                offset += chunk.height
-                
-                if total_rows:
-                    progress = (offset / total_rows) * 100
-                    print(f"    Chunk {chunk_num}: {offset:,} / {total_rows:,} rows ({progress:.1f}%)")
-                else:
-                    print(f"    Chunk {chunk_num}: {offset:,} rows processed")
-                
-                if chunk.height < chunk_size:
-                    break
-            
-            conn.close()
-            
-            # Concatenate and write to Parquet
-            print(f"  Writing {len(chunks)} chunks to Parquet...")
-            full_df = pl.concat(chunks, how="vertical_relaxed")
-            full_df.write_parquet(
-                parquet_path,
-                compression="zstd",
-                compression_level=3,
-                statistics=True,
-                row_group_size=100_000,
-                use_pyarrow=False,
+            _convert_table_streaming(
+                db_path=db_path,
+                table_name=cfg.trades_table,
+                output_path=parquet_path,
+                chunk_size=2_000_000,
             )
             
             file_size_mb = parquet_path.stat().st_size / (1024 * 1024)
@@ -117,7 +73,7 @@ def load_markets(cfg: DataConfig) -> pl.LazyFrame:
         lf = pl.scan_parquet(cfg.markets_path)
         
     elif cfg.markets_format == "sqlite":
-        # MEMORY-OPTIMIZED: Convert to Parquet if not already done
+        # MEMORY-OPTIMIZED: Convert to Parquet with streaming
         import sqlite3
         
         db_path = cfg.sqlite_path or cfg.markets_path
@@ -129,37 +85,12 @@ def load_markets(cfg: DataConfig) -> pl.LazyFrame:
         if not parquet_path.exists():
             print(f"  Converting markets table to Parquet...")
             
-            conn = sqlite3.connect(str(db_path))
-            
-            # Markets table is typically smaller, can load in larger chunks
-            chunk_size = 1_000_000
-            offset = 0
-            chunks = []
-            
-            while True:
-                query = f"SELECT * FROM {cfg.markets_table} LIMIT {chunk_size} OFFSET {offset}"
-                chunk = pl.read_database(query, connection=conn)
-                
-                if chunk.height == 0:
-                    break
-                
-                chunks.append(chunk)
-                offset += chunk.height
-                
-                if chunk.height < chunk_size:
-                    break
-            
-            conn.close()
-            
-            # Concatenate and write
-            if chunks:
-                full_df = pl.concat(chunks, how="vertical_relaxed")
-                full_df.write_parquet(
-                    parquet_path,
-                    compression="zstd",
-                    compression_level=3,
-                    use_pyarrow=False,
-                )
+            _convert_table_streaming(
+                db_path=db_path,
+                table_name=cfg.markets_table,
+                output_path=parquet_path,
+                chunk_size=500_000,  # Smaller chunks for markets
+            )
             
             print(f"  ✓ Markets converted: {parquet_path}")
         
@@ -170,6 +101,126 @@ def load_markets(cfg: DataConfig) -> pl.LazyFrame:
 
     lf = _normalize_markets(lf)
     return lf
+
+
+def _convert_table_streaming(db_path: Path, table_name: str, output_path: Path, chunk_size: int):
+    """Convert SQLite table to Parquet using streaming (minimal RAM)."""
+    import sqlite3
+    
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        print("  ⚠️  PyArrow not found, falling back to slower method...")
+        print("  Install PyArrow for better performance: pip install pyarrow")
+        _convert_table_fallback(db_path, table_name, output_path, chunk_size)
+        return
+    
+    conn = sqlite3.connect(str(db_path))
+    
+    try:
+        # Get total row count
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        total_rows = cursor.fetchone()[0]
+        print(f"  Total rows to convert: {total_rows:,}")
+        
+        offset = 0
+        chunk_num = 0
+        writer = None
+        
+        while offset < total_rows:
+            query = f"SELECT * FROM {table_name} LIMIT {chunk_size} OFFSET {offset}"
+            chunk_df = pl.read_database(query, connection=conn)
+            
+            if chunk_df.height == 0:
+                break
+            
+            # Convert to PyArrow and write incrementally
+            arrow_table = chunk_df.to_arrow()
+            
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    output_path,
+                    schema=arrow_table.schema,
+                    compression='SNAPPY',
+                    version='2.6',
+                )
+            
+            writer.write_table(arrow_table)
+            
+            chunk_num += 1
+            offset += chunk_df.height
+            
+            progress = (offset / total_rows) * 100
+            print(f"    Chunk {chunk_num}: {offset:,} / {total_rows:,} rows ({progress:.1f}%)")
+            
+            # Clean up
+            del chunk_df
+            del arrow_table
+            
+            if offset >= total_rows:
+                break
+        
+        if writer:
+            writer.close()
+            
+    finally:
+        conn.close()
+
+
+def _convert_table_fallback(db_path: Path, table_name: str, output_path: Path, chunk_size: int):
+    """Fallback conversion without PyArrow (uses more RAM but works without dependencies)."""
+    import sqlite3
+    
+    conn = sqlite3.connect(str(db_path))
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        total_rows = cursor.fetchone()[0]
+        print(f"  Total rows to convert: {total_rows:,}")
+        
+        offset = 0
+        chunk_num = 0
+        chunks = []
+        
+        # Process in smaller batches to avoid OOM
+        batch_size = min(chunk_size, 1_000_000)
+        
+        while offset < total_rows:
+            query = f"SELECT * FROM {table_name} LIMIT {batch_size} OFFSET {offset}"
+            chunk = pl.read_database(query, connection=conn)
+            
+            if chunk.height == 0:
+                break
+            
+            chunks.append(chunk)
+            offset += chunk.height
+            chunk_num += 1
+            
+            # Write batch every 5 chunks to limit RAM
+            if len(chunks) >= 5:
+                batch_df = pl.concat(chunks, how="vertical_relaxed")
+                batch_df.write_parquet(
+                    output_path,
+                    compression="snappy",
+                    use_pyarrow=False,
+                )
+                chunks = []
+                print(f"    Progress: {offset:,} / {total_rows:,} rows")
+        
+        # Write remaining chunks
+        if chunks:
+            batch_df = pl.concat(chunks, how="vertical_relaxed")
+            batch_df.write_parquet(
+                output_path,
+                compression="snappy",
+                use_pyarrow=False,
+            )
+            
+    finally:
+        conn.close()
 
 
 def _normalize_trades(lf: pl.LazyFrame, cfg: DataConfig) -> pl.LazyFrame:
