@@ -8,8 +8,11 @@ build/
 .venv/
 venv/
 model.txt
+model_*.txt
 training_log.jsonl
 data/
 *.sqlite
 *.db
 .env
+bucketed.parquet
+bucketed_*.parquet

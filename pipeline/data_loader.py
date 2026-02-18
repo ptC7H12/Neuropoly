@@ -120,16 +120,24 @@ def _normalize_markets(lf: pl.LazyFrame) -> pl.LazyFrame:
     known_cols = lf.collect_schema().names()
     if "id" in known_cols:
         rename_map["id"] = "market_id"
+    # markets.csv uses "closedTime"; our Parquet already uses "close_time"
+    if "closedTime" in known_cols and "close_time" not in known_cols:
+        rename_map["closedTime"] = "close_time"
 
     if rename_map:
         lf = lf.rename(rename_map)
 
-    lf = lf.with_columns(
-        pl.col("market_id").cast(pl.Int32),
-        pl.col("yes_price").cast(pl.Float32),
-        pl.col("no_price").cast(pl.Float32),
-        pl.col("volume").cast(pl.Float32),
-        pl.col("liquidity").cast(pl.Float32),
-    )
+    known_cols = lf.collect_schema().names()
+
+    cast_exprs = [pl.col("market_id").cast(pl.Int64)]
+
+    # Optional price/liquidity columns — present in Parquet (possibly null), absent in raw CSV
+    for col in ("yes_price", "no_price", "volume", "liquidity"):
+        if col in known_cols:
+            cast_exprs.append(pl.col(col).cast(pl.Float32))
+        else:
+            cast_exprs.append(pl.lit(None, dtype=pl.Float32).alias(col))
+
+    lf = lf.with_columns(cast_exprs)
 
     return lf
