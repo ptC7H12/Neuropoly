@@ -9,16 +9,20 @@ Polymarket ist ein Prediction Market — du wettest auf Ereignisse (z.B. "Wird T
 Jeder Trade hat einen Preis zwischen 0.00 und 1.00, der die Wahrscheinlichkeit widerspiegelt.
 
 Diese Pipeline:
-1. Liest historische Trade-Daten + Market-Snapshots
+1. Konvertiert die Roh-CSV-Dateien (markets.csv + orderFilled.csv) RAM-effizient nach Parquet
 2. Aggregiert Trades in 5-Minuten-Zeitfenster (Buckets)
 3. Berechnet 93 Features (Preis-Trends, Volumen, Momentum, ...)
 4. Trainiert ein LightGBM-Modell das vorhersagt: **"Wird dieser Trade gewinnen?"**
 5. Testet die Vorhersagen mit einem simulierten Backtest
 
 ```
-Trades (144 Mio+)
-     |
-     v
+markets.csv + orderFilled.csv
+         |
+         v
+  [convert_to_parquet.py]        <-- Chunk-weise, kein Full-Load
+  markets.parquet + trades.parquet
+         |
+         v
  [5-Min Buckets] --> [Luecken fuellen] --> [93 Features] --> [Labels]
                                                                 |
                                                                 v
@@ -26,7 +30,8 @@ Trades (144 Mio+)
                                                                 |
                                                                 v
                                                     [LightGBM Training]
-                                                    (mit Live-Dashboard)
+                                        run_pipeline.py  ODER  train_chunked.py
+                                        (komplett)              (RAM-sparend, inkrementell)
                                                                 |
                                                                 v
                                                   [P(win) Vorhersage]
@@ -37,6 +42,7 @@ Trades (144 Mio+)
 
 - Python 3.10+
 - Kein GPU noetig (alles auf CPU)
+- Ca. 25 GB RAM empfohlen (oder `train_chunked.py` fuer weniger)
 
 ## Installation
 
@@ -54,76 +60,135 @@ source venv/bin/activate        # Linux/Mac
 pip install -r requirements.txt
 ```
 
-## Daten vorbereiten
+## Datenquellen
 
-Du brauchst zwei Datenquellen:
+### `markets.csv` — Market-Stammdaten
 
-### Trades (deine Trade-Historie)
+Enthaelt Metadaten zu jedem Polymarket-Markt.
 
-CSV, Parquet oder SQLite mit diesen Spalten:
+| Spalte        | Typ      | Beispiel                                         |
+|---------------|----------|--------------------------------------------------|
+| `id`          | Integer  | `12`                                             |
+| `question`    | String   | `Will Joe Biden get Coronavirus before the election?` |
+| `answer1`     | String   | `Yes`                                            |
+| `answer2`     | String   | `No`                                             |
+| `volume`      | Float    | `32257.45`                                       |
+| `closedTime`  | Datetime | `2020-11-02 16:31:01+00`                         |
+| `market_slug` | String   | `will-joe-biden-get-coronavirus-before-the-election` |
+| `ticker`      | String   | `will-joe-biden-get-coronavirus-before-the-election` |
+| `token1`      | String   | `5313507246...` (256-Bit Token-ID fuer YES)      |
+| `token2`      | String   | `6086987146...` (256-Bit Token-ID fuer NO)       |
 
-| Spalte         | Typ      | Beispiel                           |
-|----------------|----------|------------------------------------|
-| `timestamp`    | Datetime | `2022-11-21T19:50:09.000000`       |
-| `market_id`    | Integer  | `240380`                           |
-| `side`         | String   | `token1` (YES) oder `token2` (NO)  |
-| `price`        | Float    | `0.50`                             |
-| `usd_amount`   | Float    | `50.0`                             |
-| `token_amount` | Float    | `100.0`                            |
-| `direction`    | String   | `SELL->BUY` (optional)             |
+> **Wichtig**: `token1`/`token2` sind die Schluesselspalten — sie verbinden jeden Trade
+> in `orderFilled.csv` mit dem richtigen Markt und der richtigen Seite (YES/NO).
+> `yes_price`, `no_price` und `liquidity` sind in dieser Quelle nicht enthalten und werden
+> als `null` ergaenzt (LightGBM verarbeitet Nullwerte problemlos).
 
-### Markets (Market-Snapshots)
+### `orderFilled.csv` — On-Chain Trade-Ereignisse
 
-| Spalte       | Typ      | Beispiel                              |
-|--------------|----------|---------------------------------------|
-| `id`         | Integer  | `517310`                              |
-| `question`   | String   | `Will Trump deport less than 250k?`   |
-| `volume`     | Float    | `1096126.26`                          |
-| `liquidity`  | Float    | `14864.74`                            |
-| `yes_price`  | Float    | `0.0445`                              |
-| `no_price`   | Float    | `0.9555`                              |
-| `close_time` | Datetime | `2025-12-31`                          |
+Jede Zeile ist ein ausgefuehrtes Order-Match auf der Polymarket-Blockchain (Polygon).
 
-Leg die Dateien z.B. so ab:
+| Spalte              | Typ    | Bedeutung                                              |
+|---------------------|--------|--------------------------------------------------------|
+| `timestamp`         | Int    | Unix-Timestamp (Sekunden)                              |
+| `maker`             | String | Ethereum-Adresse des Makers                            |
+| `makerAssetId`      | String | Token-ID oder `"0"` (= USDC-Zahlung)                  |
+| `makerAmountFilled` | Int    | Menge in 6-Dezimalstellen (1 000 000 = 1.0)            |
+| `taker`             | String | Ethereum-Adresse des Takers                            |
+| `takerAssetId`      | String | Token-ID oder `"0"` (= USDC-Zahlung)                  |
+| `takerAmountFilled` | Int    | Menge in 6-Dezimalstellen                              |
+| `transactionHash`   | String | On-Chain Transaktions-Hash                             |
+
+**Besonderheit**: Jeder Trade erscheint **zweimal** — einmal aus Maker-Sicht, einmal aus Taker-Sicht.
+Der Converter filtert automatisch die USDC-Leg-Zeilen (`makerAssetId == "0"`) heraus.
+
+**Preis-Berechnung** (automatisch durch Converter):
+```
+price        = takerAmountFilled / makerAmountFilled   (USDC pro Token, 0–1)
+usd_amount   = takerAmountFilled / 1_000_000           (USDC)
+token_amount = makerAmountFilled / 1_000_000           (Conditional Tokens)
+```
+
+## Schritt 1: CSV → Parquet konvertieren
+
+```bash
+# Markets konvertieren (einfach)
+python convert_to_parquet.py markets markets.csv data/markets.parquet
+
+# Trades konvertieren (braucht markets.csv fuer den Token-ID-Lookup)
+python convert_to_parquet.py trades orderFilled.csv data/trades.parquet \
+    --markets markets.csv
+
+# Ultra-low-RAM: kleinere Chunks (Standard: 500 000 Zeilen)
+python convert_to_parquet.py trades orderFilled.csv data/trades.parquet \
+    --markets markets.csv --chunk-size 100000
+
+# Beste Kompression (langsamer, kleinere Dateien)
+python convert_to_parquet.py trades orderFilled.csv data/trades.parquet \
+    --markets markets.csv --compression zstd
+```
+
+Waehrend der Konvertierung laufen **immer nur `chunk-size` Zeilen im RAM** —
+kein vollstaendiger File-Load noetig. Der Fortschritt wird zeilenweise ausgegeben:
 
 ```
-Neuropoly/
-  data/
-    trades.csv              # oder trades.parquet
-    polymarket_active.csv   # oder polymarket.db (SQLite)
+  Chunk    1:    500,000 /  72,400,000 (  0.7%) |   3.2s |   156,250 rows/s
+  Chunk    2:  1,000,000 /  72,400,000 (  1.4%) |   3.1s |   161,290 rows/s
+  ...
 ```
 
-## Schnellstart
+## Schritt 2: Pipeline starten
 
-### Mit CSV-Dateien
+### Variante A — Komplette Pipeline (run_pipeline.py)
+
+Fuer Datensaetze die komplett in den RAM passen:
 
 ```bash
 python run_pipeline.py \
-  --trades data/trades.csv \
-  --markets data/polymarket_active.csv
+  --trades data/trades.parquet --trades-format parquet \
+  --markets data/markets.parquet --markets-format parquet
+
+# Nur Statistiken pruefen (kein Training)
+python run_pipeline.py \
+  --trades data/trades.parquet --trades-format parquet \
+  --markets data/markets.parquet --markets-format parquet \
+  --dry-run
 ```
 
-### Mit SQLite-Datenbank
+### Variante B — Inkrementelles Chunk-Training (train_chunked.py)
+
+**Empfohlen bei 25 GB RAM** — verarbeitet Daten in Zeitfenstern und trainiert
+LightGBM schrittweise mit Warm-Start (`init_model`):
 
 ```bash
-# Beide Tabellen in einer DB:
+# Zuerst bucketing durchfuehren (erzeugt bucketed.parquet):
 python run_pipeline.py \
-  --sqlite-path data/polymarket.db \
-  --trades-format sqlite \
-  --markets-format sqlite \
-  --trades-table trades \
-  --markets-table markets
+  --trades data/trades.parquet --trades-format parquet \
+  --markets data/markets.parquet --markets-format parquet \
+  --dry-run
 
-# Kurzform (Tabellennamen = "trades" / "markets"):
-python run_pipeline.py \
-  --trades data/polymarket.db --trades-format sqlite \
-  --markets data/polymarket.db --markets-format sqlite
-```
+# Dann inkrementell trainieren (90-Tage-Chunks, ~6–8 GB RAM-Peak):
+python train_chunked.py \
+  --bucketed bucketed.parquet \
+  --markets data/markets.parquet \
+  --chunk-days 90 \
+  --n-estimators 200 \
+  --n-jobs 8 \
+  --model-path model.txt
 
-### Nur Statistiken ansehen (ohne Training)
+# 30-Tage-Chunks fuer noch weniger RAM:
+python train_chunked.py \
+  --bucketed bucketed.parquet \
+  --markets data/markets.parquet \
+  --chunk-days 30 \
+  --low-memory
 
-```bash
-python run_pipeline.py --trades data/trades.csv --markets data/markets.csv --dry-run
+# Training fortsetzen (nach Unterbrechung):
+python train_chunked.py \
+  --bucketed bucketed.parquet \
+  --markets data/markets.parquet \
+  --init-model model.txt \
+  --chunk-days 90
 ```
 
 ### Test mit synthetischen Daten (ohne eigene Daten)
@@ -134,7 +199,7 @@ python tests/test_pipeline_e2e.py
 
 ## Was passiert wenn ich es starte?
 
-Die Pipeline durchlaeuft 8 Schritte:
+### run_pipeline.py — 8-Schritte-Ausgabe
 
 ```
 [1/8] Loading data...
@@ -167,6 +232,22 @@ Die Pipeline durchlaeuft 8 Schritte:
   Backtest: 1,234 trades | Win rate: 58.3% | ROI: 12.4%
 ```
 
+### train_chunked.py — Inkrementelle Ausgabe
+
+```
+[3] Incremental training ...
+
+  Chunk   1: 2020-10-01  →  2020-12-31
+    Read 4,312,500 rows (incl. context)
+    Rows: 3,890,000 | Labeled: 1,102,000 | Win rate: 0.508
+    X shape: (1,012,450, 93) | positives: 514,830
+    Done in 47.3s | estimators so far: 200
+    Model saved → model.txt
+
+  Chunk   2: 2021-01-01  →  2021-03-31
+    ...
+```
+
 ## Live-Dashboard waehrend des Trainings
 
 Waehrend Schritt 7 siehst du in Echtzeit:
@@ -178,13 +259,25 @@ Waehrend Schritt 7 siehst du in Echtzeit:
 
 Alle Metriken werden auch in `training_log.jsonl` gespeichert fuer spaetere Analyse.
 
-Das Dashboard laeuft automatisch mit dem `rich`-Paket. Falls du es deaktivieren willst:
-
 ```bash
+# Dashboard deaktivieren (fuer Log-Dateien / Server)
 python run_pipeline.py --no-rich ...
 ```
 
 ## Alle CLI-Parameter
+
+### convert_to_parquet.py
+
+| Parameter        | Default     | Beschreibung                                      |
+|------------------|-------------|---------------------------------------------------|
+| `source_type`    | —           | `trades` (orderFilled.csv) oder `markets`         |
+| `input`          | —           | Pfad zur Eingabe-CSV                              |
+| `output`         | —           | Pfad zur Ausgabe-Parquet                          |
+| `--markets`      | —           | Pfad zur markets.csv (nur bei `trades` benoetigt) |
+| `--chunk-size`   | `500000`    | Zeilen pro Chunk (kleiner = weniger RAM)          |
+| `--compression`  | `snappy`    | `snappy` (schnell), `gzip`, `zstd` (klein)        |
+
+### run_pipeline.py
 
 | Parameter            | Default    | Beschreibung                          |
 |----------------------|------------|---------------------------------------|
@@ -192,9 +285,6 @@ python run_pipeline.py --no-rich ...
 | `--markets`          | `data/polymarket_active.csv` | Pfad zu Markets-Daten |
 | `--trades-format`    | `csv`      | Format: `csv`, `parquet`, `sqlite`    |
 | `--markets-format`   | `csv`      | Format: `csv`, `parquet`, `sqlite`    |
-| `--sqlite-path`      | —          | SQLite-DB-Pfad (wenn beide in einer DB) |
-| `--trades-table`     | `trades`   | SQLite Tabellenname fuer Trades       |
-| `--markets-table`    | `markets`  | SQLite Tabellenname fuer Markets      |
 | `--bucket-minutes`   | `5`        | Bucket-Groesse in Minuten             |
 | `--forward-window`   | `6`        | Label-Fenster (Buckets in die Zukunft)|
 | `--learning-rate`    | `0.05`     | LightGBM Lernrate                     |
@@ -206,17 +296,40 @@ python run_pipeline.py --no-rich ...
 | `--log-interval`     | `10`       | Dashboard-Update alle N Iterationen   |
 | `--no-rich`          | —          | Rich-Dashboard deaktivieren           |
 | `--dry-run`          | —          | Nur Statistiken, kein Training        |
+| `--low-memory`       | —          | Reduzierte Features + kleines Modell  |
+
+### train_chunked.py
+
+| Parameter            | Default     | Beschreibung                                         |
+|----------------------|-------------|------------------------------------------------------|
+| `--bucketed`         | —           | Pfad zur bucketed.parquet (aus run_pipeline.py)      |
+| `--markets`          | —           | Pfad zur markets.parquet oder markets.csv            |
+| `--markets-format`   | `parquet`   | Format der Markets-Datei                             |
+| `--chunk-days`       | `90`        | Tage pro Trainings-Chunk                             |
+| `--context-buckets`  | `60`        | Kontext-Buckets an Chunk-Grenzen (fuer Lag-Features) |
+| `--model-path`       | `model.txt` | Ausgabepfad fuer das Modell                          |
+| `--init-model`       | —           | Vorhandenes Modell weiterschreiben (Warm-Start)      |
+| `--test-days`        | `60`        | Tage am Ende fuer Hold-out-Test                      |
+| `--n-estimators`     | `200`       | LightGBM-Baeume pro Chunk                            |
+| `--learning-rate`    | `0.05`      | Lernrate                                             |
+| `--num-leaves`       | `31`        | Blaetter pro Baum                                    |
+| `--max-depth`        | `7`         | Maximale Baumtiefe                                   |
+| `--n-jobs`           | `8`         | CPU-Kerne                                            |
+| `--low-memory`       | —           | Kleineres Modell + weniger Features                  |
+| `--no-eval`          | —           | Test-Auswertung ueberspringen                        |
 
 ## Projektstruktur
 
 ```
 Neuropoly/
 ├── config.py                 # Alle Parameter zentral konfigurierbar
-├── run_pipeline.py           # Hauptprogramm (hier starten)
+├── run_pipeline.py           # Hauptprogramm — komplette Pipeline
+├── train_chunked.py          # Inkrementelles Training fuer ~25 GB RAM
+├── convert_to_parquet.py     # CSV → Parquet (chunk-weise, RAM-schonend)
 ├── requirements.txt          # Python-Abhaengigkeiten
 ├── pipeline/
 │   ├── data_loader.py        # Daten laden (CSV/Parquet/SQLite)
-│   ├── aggregation.py        # Trades -> 5-Min-Buckets
+│   ├── aggregation.py        # Trades -> 5-Min-Buckets (streamt nach Parquet)
 │   ├── gap_handler.py        # Luecken erkennen + behandeln
 │   ├── features.py           # 93 Features berechnen
 │   ├── labeling.py           # Win/Loss Labels setzen
@@ -241,8 +354,8 @@ Jetzt (Bucket t)          +30 Min (Bucket t+6)
      +-- NO Trade?  ----------> Preis gestiegen --> win = 0
 ```
 
-- **YES-Trade**: Gewinnt wenn der Preis steigt (du hast auf JA gewettet)
-- **NO-Trade**: Gewinnt wenn der Preis faellt (du hast auf NEIN gewettet)
+- **YES-Trade** (`side = "token1"`): Gewinnt wenn der Preis steigt (du hast auf JA gewettet)
+- **NO-Trade** (`side = "token2"`): Gewinnt wenn der Preis faellt (du hast auf NEIN gewettet)
 - Buckets in der **Datenluecke** (Okt 2025 – Feb 2026) bekommen kein Label
 
 ## Wichtige Konzepte fuer Anfaenger
@@ -261,8 +374,22 @@ Wir teilen die Daten zeitlich auf: Trainieren mit alten Daten, testen mit neuen.
 
 ```
 |-------- Training --------|-- Gap --|--- Validation ---|-- Gap --|--- Test ---|
-Jan 2023                   Jun 2025  Jul 2025           Aug 2025  Sep 2025
+Jan 2020                   Jun 2025  Jul 2025           Aug 2025  Sep 2025
 ```
+
+### Was ist inkrementelles Training?
+
+Bei sehr grossen Datensaetzen passt nicht alles gleichzeitig in den RAM.
+`train_chunked.py` trainiert daher in Zeitscheiben:
+
+```
+Chunk 1 (Okt–Dez 2020) → Modell v1
+Chunk 2 (Jan–Mär 2021) → Modell v1 + neue Baeume = Modell v2
+Chunk 3 (Apr–Jun 2021) → Modell v2 + neue Baeume = Modell v3
+...
+```
+
+LightGBM's `init_model`-Parameter ermoeglicht dieses Weiterschreiben ohne Neustart.
 
 ### Was ist P(win)?
 
@@ -272,34 +399,24 @@ Die vom Modell vorhergesagte Wahrscheinlichkeit, dass ein Trade gewinnt. Werte v
 
 Misst wie gut die vorhergesagten Wahrscheinlichkeiten kalibriert sind. Wenn das Modell sagt "70% Gewinnchance", sollten auch wirklich ~70% dieser Trades gewinnen. Niedrigere Werte = besser (0.0 = perfekt, 0.25 = Muenzwurf).
 
+## RAM-Verbrauch
+
+| Modus                          | Geschaetzter Peak-RAM | Wann benutzen?              |
+|-------------------------------|----------------------|-----------------------------|
+| `run_pipeline.py`              | 15–25 GB             | Standard, moderater Datensatz |
+| `run_pipeline.py --low-memory` | 3–5 GB               | Kleiner Datensatz, wenig RAM |
+| `train_chunked.py`             | 6–10 GB pro Chunk    | Grosser Datensatz, ~25 GB RAM |
+| `train_chunked.py --low-memory`| 2–4 GB pro Chunk     | Maximale RAM-Einsparung      |
+| `convert_to_parquet.py`        | < 1 GB               | Immer — echt streaming       |
+
 ## Tipps
 
-### RAM-Verbrauch senken
-
-Bei >20GB RAM-Verbrauch nutze **Ultra-Low-Memory-Mode**:
-
-```bash
-python run_pipeline.py --low-memory \
-  --trades data/trades.parquet --trades-format parquet \
-  --markets data/markets.csv \
-  --bucket-minutes 10 \
-  --n-jobs 4
-```
-
-Das reduziert RAM auf **3-5 GB** durch:
-- Deaktivierung von Cross-Market-Features
-- Reduzierte Lag/Rolling-Windows (5 → 2-3 Features statt 93)
-- Kleineres Modell (num_leaves=15, max_depth=5)
-- Polars Streaming-Backend (verarbeitet in Chunks)
-- 10-Min-Buckets statt 5-Min (50% weniger Zeilen)
-
-### Allgemeine Tipps
-
 - **Erster Lauf**: Nutze `--dry-run` um die Daten-Statistiken zu pruefen bevor du trainierst
-- **Datenformat**: Parquet >> CSV >> SQLite (RAM-weise)
+- **Datenformat**: Parquet >> CSV (schneller, weniger RAM)
 - **Langsames Training**: Reduziere `--num-leaves` oder `--max-depth`
 - **Overfitting**: Wenn Train-AUC >> Val-AUC, erhoehe `min_child_samples` in `config.py`
-- **Modell laden**: Nach dem Training liegt das Modell in `model.txt` und kann wiederverwendet werden
+- **Modell fortsetzen**: `train_chunked.py --init-model model.txt` schreibt ein vorhandenes Modell weiter
+- **Kompression**: `--compression zstd` bei `convert_to_parquet.py` spart ~30% Speicher vs. snappy
 
 ## Lizenz
 
