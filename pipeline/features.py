@@ -185,9 +185,15 @@ def _add_market_features(df: pl.DataFrame, markets: pl.DataFrame) -> pl.DataFram
 
     # Days to close
     if "close_time" in df.columns:
-        df = df.with_columns(
-            pl.col("close_time").cast(pl.Datetime("us")).alias("close_time_dt"),
-        )
+        # Normalize to tz-naive Datetime so subtraction works regardless of
+        # whether close_time was loaded from a tz-aware Parquet or a raw CSV.
+        close_dtype = df.schema["close_time"]
+        if getattr(close_dtype, "time_zone", None):
+            close_col = pl.col("close_time").dt.replace_time_zone(None)
+        else:
+            close_col = pl.col("close_time").cast(pl.Datetime("us"))
+
+        df = df.with_columns(close_col.alias("close_time_dt"))
         df = df.with_columns(
             (
                 (pl.col("close_time_dt") - pl.col("bucket_time")).dt.total_seconds()

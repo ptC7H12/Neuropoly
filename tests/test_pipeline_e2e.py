@@ -116,7 +116,8 @@ def test_full_pipeline():
 
     # Aggregate
     print("\n[2] Aggregating into buckets...")
-    bucketed = aggregate_trades(trades_lf, cfg.bucket)
+    bucketed_path = aggregate_trades(trades_lf, cfg.bucket)
+    bucketed = pl.scan_parquet(bucketed_path).collect(streaming=True)
     print(f"  Bucketed: {bucketed.height} rows")
     assert bucketed.height > 0, "Bucketed should have rows"
 
