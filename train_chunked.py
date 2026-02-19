@@ -135,10 +135,17 @@ def _process_chunk(
     if chunk_df.height == 0:
         return None
 
-    # Gap handling on this chunk
-    filled = fill_buckets(chunk_df, cfg.bucket, cfg.gap)
-    filled = detect_consecutive_gaps(filled, cfg.gap)
-    filled = apply_gap_exclusions(filled, cfg.gap)
+    # Gap handling — streaming writes, O(1) peak RAM per market
+    filled_path = fill_buckets(chunk_df, cfg.bucket, cfg.gap,
+                               output_path="_chunk_filled.parquet")
+    del chunk_df
+    gc.collect()
+
+    filled_path = detect_consecutive_gaps(filled_path, cfg.gap,
+                                          output_path="_chunk_filled_gaps.parquet")
+    filled_path = apply_gap_exclusions(filled_path, cfg.gap,
+                                       output_path="_chunk_filled_final.parquet")
+    filled = pl.scan_parquet(filled_path).collect()
 
     # Features
     featured = build_features(filled, markets_df, cfg.features)

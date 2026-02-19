@@ -4,13 +4,26 @@ Gap detection, filling, and exclusion for bucketed trade data.
 Handles two types of gaps:
 1. Explicit gap period (e.g., Oct 2025 – Feb 2026 data outage)
 2. Implicit gaps (markets with no trades for extended periods)
+
+Memory strategy
+---------------
+fill_buckets() and detect_consecutive_gaps() write results directly to
+Parquet via a streaming PyArrow writer — only one market's data lives in
+RAM at any time.  apply_gap_exclusions() uses Polars' sink_parquet() so
+the final flag column is also computed without a full collect().
 """
 
-import polars as pl
+import gc
+from pathlib import Path
 from datetime import timedelta
+
+import polars as pl
+import pyarrow.parquet as pq
 
 from config import GapConfig, BucketConfig
 
+
+# ── Gap detection (summary only — stays small, kept in RAM) ───────────────────
 
 def detect_gaps(
     bucketed: pl.DataFrame,
@@ -66,34 +79,42 @@ def detect_gaps(
     return summary
 
 
+# ── Streaming gap fill ────────────────────────────────────────────────────────
+
 def fill_buckets(
     bucketed: pl.DataFrame,
     bucket_cfg: BucketConfig,
     gap_cfg: GapConfig,
-) -> pl.DataFrame:
+    output_path: str = "filled.parquet",
+) -> str:
     """
     For each market, create a complete time series of buckets.
-    Missing buckets are filled with NaN values and flagged.
+    Missing buckets are filled with NaN / 0 and flagged.
 
-    Buckets inside the explicit gap period are marked as
-    `in_gap=True` so they can be excluded from training.
+    Writes one market at a time directly to *output_path* via a
+    PyArrow streaming writer — peak RAM = one market's rows.
+
+    Returns the output file path.
     """
 
     bucket_minutes = bucket_cfg.bucket_minutes
-    all_filled = []
+    output_path = str(Path(output_path))
 
     market_ids = bucketed["market_id"].unique().sort().to_list()
+    n_markets = len(market_ids)
+    writer = None
 
-    for market_id in market_ids:
+    for idx, market_id in enumerate(market_ids, 1):
         market_df = bucketed.filter(pl.col("market_id") == market_id)
 
         start = market_df["bucket_time"].min()
         end = market_df["bucket_time"].max()
 
         if start is None or end is None:
+            del market_df
             continue
 
-        # Generate complete bucket range
+        # Generate complete bucket range for this market
         n_buckets = int((end - start).total_seconds() / (bucket_minutes * 60)) + 1
         full_range = pl.DataFrame(
             {
@@ -102,17 +123,13 @@ def fill_buckets(
                 ),
                 "market_id": [market_id] * n_buckets,
             }
-        )
-
-        # Ensure types match
-        full_range = full_range.with_columns(
-            pl.col("market_id").cast(pl.Int64),
-        )
+        ).with_columns(pl.col("market_id").cast(pl.Int64))
 
         # Left join: keep all buckets, fill missing with null
         merged = full_range.join(
             market_df, on=["market_id", "bucket_time"], how="left"
         )
+        del full_range, market_df
 
         # Flag: is this a filled (empty) bucket?
         merged = merged.with_columns(
@@ -128,21 +145,14 @@ def fill_buckets(
                 ).alias("in_gap"),
             )
         else:
-            merged = merged.with_columns(
-                pl.lit(False).alias("in_gap"),
-            )
+            merged = merged.with_columns(pl.lit(False).alias("in_gap"))
 
-        # Fill numeric columns with 0 for trade counts, NaN for prices
+        # Fill numeric columns
         count_cols = ["trade_count", "whale_count"]
-        usd_cols = ["total_usd", "total_tokens", "whale_usd"]
+        usd_cols   = ["total_usd", "total_tokens", "whale_usd"]
         price_cols = [
-            "open_price",
-            "close_price",
-            "high_price",
-            "low_price",
-            "mean_price",
-            "vwap",
-            "momentum",
+            "open_price", "close_price", "high_price",
+            "low_price", "mean_price", "vwap", "momentum",
         ]
 
         for col in count_cols:
@@ -153,97 +163,183 @@ def fill_buckets(
             if col in merged.columns:
                 merged = merged.with_columns(pl.col(col).fill_null(0.0))
 
-        # For price columns in empty buckets: forward-fill from last known price
+        # Forward-fill price columns from last known value
         for col in price_cols:
             if col in merged.columns:
                 merged = merged.with_columns(
-                    pl.col(col).forward_fill().alias(col),
+                    pl.col(col).forward_fill().alias(col)
                 )
 
-        # yes_ratio, buy_ratio: fill with 0.5 (neutral) for empty buckets
+        # Neutral fill for ratio columns
         for col in ["yes_ratio", "buy_ratio"]:
             if col in merged.columns:
                 merged = merged.with_columns(pl.col(col).fill_null(0.5))
 
-        all_filled.append(merged)
+        # ── stream-write this market's rows to Parquet ──
+        arrow_tbl = merged.to_arrow()
+        if writer is None:
+            writer = pq.ParquetWriter(
+                output_path,
+                schema=arrow_tbl.schema,
+                compression="SNAPPY",
+                version="2.6",
+            )
+        writer.write_table(arrow_tbl)
 
-    if not all_filled:
-        return bucketed.with_columns(
-            pl.lit(False).alias("is_empty_bucket"),
-            pl.lit(False).alias("in_gap"),
-        )
+        del merged, arrow_tbl
+        gc.collect()
 
-    return pl.concat(all_filled).sort(["market_id", "bucket_time"])
+        if idx % 100 == 0 or idx == n_markets:
+            print(f"  fill_buckets: {idx}/{n_markets} markets", flush=True)
 
+    if writer:
+        writer.close()
+    else:
+        # Edge case: nothing was written — create empty Parquet with base schema
+        _write_empty_filled(output_path, bucketed)
+
+    return output_path
+
+
+def _write_empty_filled(output_path: str, bucketed: pl.DataFrame) -> None:
+    """Write an empty Parquet with the expected schema."""
+    empty = bucketed.clear().with_columns(
+        pl.lit(False).alias("is_empty_bucket"),
+        pl.lit(False).alias("in_gap"),
+    )
+    empty.write_parquet(output_path)
+
+
+# ── Streaming consecutive-gap detection ───────────────────────────────────────
 
 def detect_consecutive_gaps(
-    filled: pl.DataFrame,
+    filled_path: str,
     gap_cfg: GapConfig,
-) -> pl.DataFrame:
+    output_path: str = "filled_gaps.parquet",
+) -> str:
     """
     Detect runs of consecutive empty buckets per market.
-    Returns the filled DataFrame with an additional column
-    `in_long_gap` for runs exceeding max_empty_buckets.
+    Adds `in_long_gap` (bool) column for runs exceeding max_empty_buckets.
+
+    Reads *filled_path* row-group by row-group (fill_buckets writes exactly
+    one row group per market), so the entire file is scanned **once** in
+    O(1) RAM — no repeated full-file scans.
+
+    Returns the output file path.
     """
 
-    results = []
+    output_path = str(Path(output_path))
 
-    for market_id in filled["market_id"].unique().sort().to_list():
-        market_df = filled.filter(pl.col("market_id") == market_id)
+    pf = pq.ParquetFile(filled_path)
+    n_rg = pf.metadata.num_row_groups
 
-        # Compute run-length encoding of is_empty_bucket
+    writer = None
+
+    for rg_idx in range(n_rg):
+        # Read one row group = one market (guaranteed by fill_buckets)
+        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+
+        # Run-length encoding of is_empty_bucket
         empty = market_df["is_empty_bucket"].to_list()
-        run_lengths = []
-        current_run = 0
 
-        for is_empty in empty:
-            if is_empty:
-                current_run += 1
-            else:
-                current_run = 0
-            run_lengths.append(current_run)
+        forward_run, backward_run = [], []
+        cur = 0
+        for v in empty:
+            cur = cur + 1 if v else 0
+            forward_run.append(cur)
 
-        # Also compute backward run length (how long the gap continues)
-        backward_runs = []
-        current_run = 0
-        for is_empty in reversed(empty):
-            if is_empty:
-                current_run += 1
-            else:
-                current_run = 0
-            backward_runs.append(current_run)
-        backward_runs.reverse()
+        cur = 0
+        for v in reversed(empty):
+            cur = cur + 1 if v else 0
+            backward_run.append(cur)
+        backward_run.reverse()
 
-        # A bucket is in a long gap if it's part of a consecutive run
-        # that exceeds the threshold
-        max_run = [max(f, b) for f, b in zip(run_lengths, backward_runs)]
+        max_run    = [max(f, b) for f, b in zip(forward_run, backward_run)]
         in_long_gap = [r > gap_cfg.max_empty_buckets for r in max_run]
 
         market_df = market_df.with_columns(
             pl.Series("in_long_gap", in_long_gap),
         )
 
-        results.append(market_df)
+        arrow_tbl = market_df.to_arrow()
+        if writer is None:
+            writer = pq.ParquetWriter(
+                output_path,
+                schema=arrow_tbl.schema,
+                compression="SNAPPY",
+                version="2.6",
+            )
+        writer.write_table(arrow_tbl)
 
-    if not results:
-        return filled.with_columns(pl.lit(False).alias("in_long_gap"))
+        del market_df, arrow_tbl, empty, forward_run, backward_run, max_run, in_long_gap
+        gc.collect()
 
-    return pl.concat(results).sort(["market_id", "bucket_time"])
+        if (rg_idx + 1) % 100 == 0 or (rg_idx + 1) == n_rg:
+            print(f"  detect_consecutive_gaps: {rg_idx + 1}/{n_rg} markets", flush=True)
 
+    if writer:
+        writer.close()
+    else:
+        _copy_parquet_with_col(filled_path, output_path, "in_long_gap", False)
+
+    return output_path
+
+
+# ── Streaming gap exclusion flag ──────────────────────────────────────────────
 
 def apply_gap_exclusions(
-    filled: pl.DataFrame,
+    filled_path: str,
     gap_cfg: GapConfig,
-) -> pl.DataFrame:
+    output_path: str = "filled_final.parquet",
+) -> str:
     """
-    Combine all gap flags into a single `exclude_from_training` column.
-    A bucket is excluded if:
-    - It falls in the explicit gap period, OR
-    - It's part of a long consecutive gap
+    Combine gap flags into `exclude_from_training`.
+    Reads *filled_path* row-group by row-group (one market per row group,
+    guaranteed by detect_consecutive_gaps) — O(1) RAM.
+
+    Returns the output file path.
     """
 
-    filled = filled.with_columns(
-        (pl.col("in_gap") | pl.col("in_long_gap")).alias("exclude_from_training"),
+    output_path = str(Path(output_path))
+
+    pf = pq.ParquetFile(filled_path)
+    n_rg = pf.metadata.num_row_groups
+    writer = None
+
+    for rg_idx in range(n_rg):
+        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+
+        market_df = market_df.with_columns(
+            (pl.col("in_gap") | pl.col("in_long_gap")).alias("exclude_from_training")
+        )
+
+        arrow_tbl = market_df.to_arrow()
+        if writer is None:
+            writer = pq.ParquetWriter(
+                output_path,
+                schema=arrow_tbl.schema,
+                compression="SNAPPY",
+                version="2.6",
+            )
+        writer.write_table(arrow_tbl)
+
+        del market_df, arrow_tbl
+        gc.collect()
+
+    if writer:
+        writer.close()
+    else:
+        _copy_parquet_with_col(filled_path, output_path, "exclude_from_training", False)
+
+    return output_path
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _copy_parquet_with_col(src: str, dst: str, col_name: str, default_val) -> None:
+    """Copy a Parquet file and add a constant column."""
+    (
+        pl.scan_parquet(src)
+        .with_columns(pl.lit(default_val).alias(col_name))
+        .sink_parquet(dst)
     )
-
-    return filled

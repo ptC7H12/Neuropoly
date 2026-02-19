@@ -16,3 +16,11 @@ data/
 .env
 bucketed.parquet
 bucketed_*.parquet
+filled.parquet
+filled_*.parquet
+*_filled.parquet
+*_filled_*.parquet
+test_filled*.parquet
+features.parquet
+features_*.parquet
+_chunk_*.parquet

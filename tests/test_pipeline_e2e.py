@@ -117,7 +117,7 @@ def test_full_pipeline():
     # Aggregate
     print("\n[2] Aggregating into buckets...")
     bucketed_path = aggregate_trades(trades_lf, cfg.bucket)
-    bucketed = pl.scan_parquet(bucketed_path).collect(streaming=True)
+    bucketed = pl.scan_parquet(bucketed_path).collect(engine="streaming")
     print(f"  Bucketed: {bucketed.height} rows")
     assert bucketed.height > 0, "Bucketed should have rows"
 
@@ -126,9 +126,13 @@ def test_full_pipeline():
     gap_summary = detect_gaps(bucketed, cfg.bucket, cfg.gap)
     print(f"  Gap summary: {gap_summary.height} markets")
 
-    filled = fill_buckets(bucketed, cfg.bucket, cfg.gap)
-    filled = detect_consecutive_gaps(filled, cfg.gap)
-    filled = apply_gap_exclusions(filled, cfg.gap)
+    filled_path = fill_buckets(bucketed, cfg.bucket, cfg.gap,
+                               output_path="test_filled.parquet")
+    filled_path = detect_consecutive_gaps(filled_path, cfg.gap,
+                                          output_path="test_filled_gaps.parquet")
+    filled_path = apply_gap_exclusions(filled_path, cfg.gap,
+                                       output_path="test_filled_final.parquet")
+    filled = pl.scan_parquet(filled_path).collect()
     print(f"  Filled: {filled.height} rows")
     assert filled.height >= bucketed.height, "Filled should have at least as many rows"
 
