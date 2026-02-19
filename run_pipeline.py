@@ -20,6 +20,7 @@ Steps:
 """
 
 import argparse
+import gc
 import sys
 import time
 from pathlib import Path
@@ -146,7 +147,7 @@ def main():
     # ── Step 2: Aggregate into buckets ─────────────────────────
     print(f"\n[2/8] Aggregating trades into {cfg.bucket.bucket_minutes}-min buckets...")
     bucketed_path = aggregate_trades(trades_lf, cfg.bucket)
-    bucketed = pl.scan_parquet(bucketed_path).collect(streaming=True)
+    bucketed = pl.scan_parquet(bucketed_path).collect(engine="streaming")
     n_markets = bucketed["market_id"].n_unique()
     print(f"  Bucketed: {bucketed.height} rows across {n_markets} markets")
 
@@ -158,12 +159,23 @@ def main():
     high_gap = gap_summary.filter(gap_summary["gap_ratio"] > 0.5)
     print(f"    Markets with >50% gaps: {high_gap.height}")
 
-    filled = fill_buckets(bucketed, cfg.bucket, cfg.gap)
-    filled = detect_consecutive_gaps(filled, cfg.gap)
-    filled = apply_gap_exclusions(filled, cfg.gap)
+    # Stream-fill: writes one market at a time → O(1) peak RAM per market
+    filled_path = fill_buckets(bucketed, cfg.bucket, cfg.gap)
+    del bucketed
+    gc.collect()
 
-    n_excluded = filled.filter(filled["exclude_from_training"]).height
-    print(f"  After filling: {filled.height} rows ({n_excluded} excluded from training)")
+    filled_path = detect_consecutive_gaps(filled_path, cfg.gap)
+    filled_path = apply_gap_exclusions(filled_path, cfg.gap)
+
+    # Count excluded rows without loading the full DataFrame
+    stats_lf   = pl.scan_parquet(filled_path)
+    n_total    = stats_lf.select(pl.len()).collect()[0, 0]
+    n_excluded = stats_lf.filter(pl.col("exclude_from_training")).select(pl.len()).collect()[0, 0]
+    print(f"  After filling: {n_total:,} rows ({n_excluded:,} excluded from training)")
+
+    # Load into memory for feature engineering
+    print("  Loading filled data into memory …")
+    filled = pl.scan_parquet(filled_path).collect()
 
     # ── Step 4: Feature engineering ────────────────────────────
     print("\n[4/8] Engineering features...")
