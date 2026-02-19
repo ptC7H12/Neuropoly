@@ -221,33 +221,23 @@ def detect_consecutive_gaps(
     Detect runs of consecutive empty buckets per market.
     Adds `in_long_gap` (bool) column for runs exceeding max_empty_buckets.
 
-    Reads *filled_path* market-by-market via Polars lazy scan (predicate
-    pushdown keeps RAM minimal).  Writes results to *output_path*.
+    Reads *filled_path* row-group by row-group (fill_buckets writes exactly
+    one row group per market), so the entire file is scanned **once** in
+    O(1) RAM — no repeated full-file scans.
 
     Returns the output file path.
     """
 
     output_path = str(Path(output_path))
 
-    # Fetch only the market IDs — tiny query
-    market_ids = (
-        pl.scan_parquet(filled_path)
-        .select("market_id")
-        .unique()
-        .sort("market_id")
-        .collect()["market_id"]
-        .to_list()
-    )
+    pf = pq.ParquetFile(filled_path)
+    n_rg = pf.metadata.num_row_groups
 
-    n_markets = len(market_ids)
     writer = None
 
-    for idx, market_id in enumerate(market_ids, 1):
-        market_df = (
-            pl.scan_parquet(filled_path)
-            .filter(pl.col("market_id") == market_id)
-            .collect()
-        )
+    for rg_idx in range(n_rg):
+        # Read one row group = one market (guaranteed by fill_buckets)
+        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
 
         # Run-length encoding of is_empty_bucket
         empty = market_df["is_empty_bucket"].to_list()
@@ -264,7 +254,7 @@ def detect_consecutive_gaps(
             backward_run.append(cur)
         backward_run.reverse()
 
-        max_run = [max(f, b) for f, b in zip(forward_run, backward_run)]
+        max_run    = [max(f, b) for f, b in zip(forward_run, backward_run)]
         in_long_gap = [r > gap_cfg.max_empty_buckets for r in max_run]
 
         market_df = market_df.with_columns(
@@ -284,8 +274,8 @@ def detect_consecutive_gaps(
         del market_df, arrow_tbl, empty, forward_run, backward_run, max_run, in_long_gap
         gc.collect()
 
-        if idx % 100 == 0 or idx == n_markets:
-            print(f"  detect_consecutive_gaps: {idx}/{n_markets} markets", flush=True)
+        if (rg_idx + 1) % 100 == 0 or (rg_idx + 1) == n_rg:
+            print(f"  detect_consecutive_gaps: {rg_idx + 1}/{n_rg} markets", flush=True)
 
     if writer:
         writer.close()
@@ -304,20 +294,42 @@ def apply_gap_exclusions(
 ) -> str:
     """
     Combine gap flags into `exclude_from_training`.
-    Uses Polars sink_parquet (streaming engine) — O(1) RAM.
+    Reads *filled_path* row-group by row-group (one market per row group,
+    guaranteed by detect_consecutive_gaps) — O(1) RAM.
 
     Returns the output file path.
     """
 
     output_path = str(Path(output_path))
 
-    (
-        pl.scan_parquet(filled_path)
-        .with_columns(
+    pf = pq.ParquetFile(filled_path)
+    n_rg = pf.metadata.num_row_groups
+    writer = None
+
+    for rg_idx in range(n_rg):
+        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+
+        market_df = market_df.with_columns(
             (pl.col("in_gap") | pl.col("in_long_gap")).alias("exclude_from_training")
         )
-        .sink_parquet(output_path)
-    )
+
+        arrow_tbl = market_df.to_arrow()
+        if writer is None:
+            writer = pq.ParquetWriter(
+                output_path,
+                schema=arrow_tbl.schema,
+                compression="SNAPPY",
+                version="2.6",
+            )
+        writer.write_table(arrow_tbl)
+
+        del market_df, arrow_tbl
+        gc.collect()
+
+    if writer:
+        writer.close()
+    else:
+        _copy_parquet_with_col(filled_path, output_path, "exclude_from_training", False)
 
     return output_path
 

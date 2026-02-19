@@ -39,7 +39,7 @@ from pipeline.gap_handler import (
     detect_consecutive_gaps,
     apply_gap_exclusions,
 )
-from pipeline.features import build_features, get_feature_columns
+from pipeline.features import build_features, build_features_streaming, get_feature_columns
 from pipeline.labeling import add_labels, label_stats
 from pipeline.splitter import walk_forward_split, print_split_info
 from pipeline.model import train_model, predict, feature_importance
@@ -173,19 +173,27 @@ def main():
     n_excluded = stats_lf.filter(pl.col("exclude_from_training")).select(pl.len()).collect()[0, 0]
     print(f"  After filling: {n_total:,} rows ({n_excluded:,} excluded from training)")
 
-    # Load into memory for feature engineering
-    print("  Loading filled data into memory …")
-    filled = pl.scan_parquet(filled_path).collect()
+    if args.dry_run:
+        print("\n[DRY RUN] Stopping before feature engineering.")
+        print(f"  Time: {time.time() - t0:.1f}s")
+        return
 
-    # ── Step 4: Feature engineering ────────────────────────────
-    print("\n[4/8] Engineering features...")
-    featured = build_features(filled, markets_df, cfg.features)
-    feature_cols = get_feature_columns(featured)
+    # ── Step 4: Feature engineering (streaming, O(1) RAM per market) ──
+    print("\n[4/8] Engineering features (streaming)...")
+    features_path = build_features_streaming(filled_path, markets_df, cfg.features)
+    # Read schema only — no collect of the full matrix yet
+    _schema_df = pl.scan_parquet(features_path).limit(0).collect()
+    feature_cols = get_feature_columns(_schema_df)
+    del _schema_df
     print(f"  Features: {len(feature_cols)} columns")
 
     # ── Step 5: Labeling ───────────────────────────────────────
     print(f"\n[5/8] Generating labels (forward window: {cfg.label.forward_window_buckets} buckets)...")
+    print("  Loading features into memory …")
+    featured = pl.scan_parquet(features_path).collect()
     labeled = add_labels(featured, cfg.label)
+    del featured
+    gc.collect()
     stats = label_stats(labeled)
     print(f"  Total rows:  {stats['total_rows']}")
     print(f"  Labeled:     {stats['labeled']}")
@@ -193,11 +201,6 @@ def main():
     print(f"  Win rate:    {stats['win_rate']:.3f}")
     if stats.get("mean_future_return") is not None:
         print(f"  Mean return: {stats['mean_future_return']:.5f}")
-
-    if args.dry_run:
-        print("\n[DRY RUN] Stopping before training.")
-        print(f"  Time: {time.time() - t0:.1f}s")
-        return
 
     # ── Step 6: Train/Val/Test split ───────────────────────────
     print("\n[6/8] Walk-forward split...")

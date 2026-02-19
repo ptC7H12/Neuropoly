@@ -2,8 +2,12 @@
 Feature engineering: bucket-level, market-level, lag, rolling, cross, and time features.
 """
 
+import gc
 import math
+from pathlib import Path
+
 import polars as pl
+import pyarrow.parquet as pq
 from datetime import datetime
 
 from config import FeatureConfig
@@ -49,6 +53,64 @@ def build_features(
         df = _add_time_features(df)
 
     return df
+
+
+def build_features_streaming(
+    filled_path: str,
+    markets: pl.DataFrame,
+    cfg: FeatureConfig,
+    output_path: str = "features.parquet",
+) -> str:
+    """
+    Build features one market at a time from a gap-filled Parquet file.
+
+    *filled_path* must contain exactly one row group per market — this is
+    guaranteed by the gap_handler streaming pipeline (fill_buckets →
+    detect_consecutive_gaps → apply_gap_exclusions all write with PyArrow,
+    one market per write_table call).
+
+    Writes the feature matrix to *output_path* via a streaming PyArrow
+    writer — peak RAM = one market's rows.  Returns output_path.
+    """
+
+    output_path = str(Path(output_path))
+
+    if hasattr(markets, "collect"):
+        markets = markets.collect()
+
+    pf = pq.ParquetFile(filled_path)
+    n_rg = pf.metadata.num_row_groups
+    writer = None
+
+    for rg_idx in range(n_rg):
+        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+
+        featured = build_features(market_df, markets, cfg)
+        del market_df
+
+        arrow_tbl = featured.to_arrow()
+        if writer is None:
+            writer = pq.ParquetWriter(
+                output_path,
+                schema=arrow_tbl.schema,
+                compression="SNAPPY",
+                version="2.6",
+            )
+        writer.write_table(arrow_tbl)
+
+        del featured, arrow_tbl
+        gc.collect()
+
+        if (rg_idx + 1) % 100 == 0 or (rg_idx + 1) == n_rg:
+            print(f"  build_features: {rg_idx + 1}/{n_rg} markets", flush=True)
+
+    if writer:
+        writer.close()
+    else:
+        # Edge case: empty filled file — write empty Parquet
+        pl.scan_parquet(filled_path).collect().write_parquet(output_path)
+
+    return output_path
 
 
 def _add_lag_features(df: pl.DataFrame, cfg: FeatureConfig) -> pl.DataFrame:
