@@ -8,7 +8,11 @@ Binary label:  win ∈ {0, 1}
 Regression target: future_return = (future_price - entry_price) / entry_price
 """
 
+import gc
+from pathlib import Path
+
 import polars as pl
+import pyarrow.parquet as pq
 
 from config import LabelConfig
 
@@ -137,3 +141,93 @@ def label_stats(df: pl.DataFrame) -> dict:
             labeled["future_return"].std() if "future_return" in labeled.columns else None
         ),
     }
+
+
+def add_labels_streaming(
+    features_path: str,
+    cfg: LabelConfig,
+    output_path: str = "labeled.parquet",
+) -> str:
+    """
+    Add win/future_return labels one market at a time from a features Parquet
+    file.  Peak RAM = one market's rows (same row-group-per-market invariant
+    guaranteed by build_features_streaming).
+
+    Returns the output file path.
+    """
+
+    output_path = str(Path(output_path))
+
+    pf = pq.ParquetFile(features_path)
+    n_rg = pf.metadata.num_row_groups
+    writer = None
+
+    for rg_idx in range(n_rg):
+        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+
+        labeled_df = add_labels(market_df, cfg)
+        del market_df
+
+        arrow_tbl = labeled_df.to_arrow()
+        if writer is None:
+            writer = pq.ParquetWriter(
+                output_path,
+                schema=arrow_tbl.schema,
+                compression="SNAPPY",
+                version="2.6",
+            )
+        writer.write_table(arrow_tbl)
+
+        del labeled_df, arrow_tbl
+        gc.collect()
+
+    if writer:
+        writer.close()
+    else:
+        pl.scan_parquet(features_path).collect().write_parquet(output_path)
+
+    return output_path
+
+
+def label_stats_lazy(labeled_path: str) -> dict:
+    """
+    Compute label statistics from a labeled Parquet file without loading
+    it fully into RAM.  Uses a single lazy aggregation pass.
+    """
+
+    lf = pl.scan_parquet(labeled_path)
+    schema_names = lf.collect_schema().names()
+    has_future_return = "future_return" in schema_names
+
+    agg_exprs = [
+        pl.len().alias("n_total"),
+        pl.col("win").is_not_null().sum().alias("n_labeled"),
+        (pl.col("win") == 1).sum().alias("wins"),
+        (pl.col("win") == 0).sum().alias("losses"),
+    ]
+    if has_future_return:
+        agg_exprs += [
+            pl.col("future_return").mean().alias("mean_future_return"),
+            pl.col("future_return").std().alias("std_future_return"),
+        ]
+
+    row = lf.select(agg_exprs).collect()
+
+    n_total   = int(row["n_total"][0])
+    n_labeled = int(row["n_labeled"][0])
+    wins      = int(row["wins"][0])
+    losses    = int(row["losses"][0])
+
+    result = {
+        "total_rows": n_total,
+        "labeled":    n_labeled,
+        "nullified":  n_total - n_labeled,
+        "wins":       wins,
+        "losses":     losses,
+        "win_rate":   wins / n_labeled if n_labeled > 0 else 0.0,
+    }
+    if has_future_return:
+        result["mean_future_return"] = row["mean_future_return"][0]
+        result["std_future_return"]  = row["std_future_return"][0]
+
+    return result

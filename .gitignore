@@ -23,4 +23,6 @@ filled_*.parquet
 test_filled*.parquet
 features.parquet
 features_*.parquet
+labeled.parquet
+labeled_*.parquet
 _chunk_*.parquet
