@@ -40,7 +40,7 @@ from pipeline.gap_handler import (
     apply_gap_exclusions,
 )
 from pipeline.features import build_features, build_features_streaming, get_feature_columns
-from pipeline.labeling import add_labels, label_stats
+from pipeline.labeling import add_labels, label_stats, add_labels_streaming, label_stats_lazy
 from pipeline.splitter import walk_forward_split, print_split_info
 from pipeline.model import train_model, predict, feature_importance
 from pipeline.evaluation import evaluate, backtest, print_evaluation
@@ -187,14 +187,10 @@ def main():
     del _schema_df
     print(f"  Features: {len(feature_cols)} columns")
 
-    # ── Step 5: Labeling ───────────────────────────────────────
+    # ── Step 5: Labeling (streaming, O(1) RAM per market) ──────
     print(f"\n[5/8] Generating labels (forward window: {cfg.label.forward_window_buckets} buckets)...")
-    print("  Loading features into memory …")
-    featured = pl.scan_parquet(features_path).collect()
-    labeled = add_labels(featured, cfg.label)
-    del featured
-    gc.collect()
-    stats = label_stats(labeled)
+    labeled_path = add_labels_streaming(features_path, cfg.label)
+    stats = label_stats_lazy(labeled_path)
     print(f"  Total rows:  {stats['total_rows']}")
     print(f"  Labeled:     {stats['labeled']}")
     print(f"  Nullified:   {stats['nullified']}")
@@ -204,7 +200,17 @@ def main():
 
     # ── Step 6: Train/Val/Test split ───────────────────────────
     print("\n[6/8] Walk-forward split...")
+    # Load only labeled rows (win IS NOT NULL) — significantly smaller
+    # than the full feature matrix (excluded/empty buckets dropped).
+    print("  Loading labeled rows into memory …")
+    labeled = (
+        pl.scan_parquet(labeled_path)
+        .filter(pl.col("win").is_not_null())
+        .collect()
+    )
     split = walk_forward_split(labeled, feature_cols, cfg.split, cfg.label)
+    del labeled
+    gc.collect()
     print_split_info(split)
 
     # ── Step 7: Train LightGBM ─────────────────────────────────
