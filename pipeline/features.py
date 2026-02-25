@@ -352,8 +352,12 @@ def _add_time_features(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def get_feature_columns(df: pl.DataFrame) -> list[str]:
-    """Return the list of feature column names (excludes metadata and target)."""
+def get_feature_columns(df) -> list[str]:
+    """Return the list of feature column names (excludes metadata and target).
+
+    Accepts a pl.DataFrame, pl.LazyFrame, or a Polars Schema object so that
+    callers can avoid a full collect() just to obtain column names.
+    """
 
     exclude = {
         "bucket_time",
@@ -369,7 +373,13 @@ def get_feature_columns(df: pl.DataFrame) -> list[str]:
         "close_time",
     }
 
-    return [col for col in df.columns if col not in exclude]
+    # Schema objects (returned by collect_schema()) expose .names()
+    if hasattr(df, "names"):
+        columns = df.names()
+    else:
+        columns = df.columns
+
+    return [col for col in columns if col not in exclude]
 
 
 def _entropy(p: float) -> float:
