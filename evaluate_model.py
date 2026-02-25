@@ -35,8 +35,10 @@ Output:
 
 import argparse
 import gc
+import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +60,7 @@ from pipeline.labeling import add_labels_streaming, label_stats_lazy
 from pipeline.model import load_model, predict, feature_importance
 from pipeline.splitter import walk_forward_split, print_split_info
 from pipeline.evaluation import evaluate, backtest, print_evaluation, EvalMetrics, BacktestResult
+from pipeline.results_logger import append_to_log, print_log_history
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +88,9 @@ def parse_args() -> argparse.Namespace:
                    help="Smaller feature set, less RAM")
     p.add_argument("--keep-intermediates", action="store_true",
                    help="Keep bucketed/filled/features/labeled Parquet files after evaluation")
+    p.add_argument("--log-file", default="results_log.jsonl", metavar="PATH",
+                   help="JSONL file to append results to for historical tracking "
+                        "(default: results_log.jsonl). Pass '' to disable.")
     return p.parse_args()
 
 
@@ -284,13 +290,23 @@ def main() -> None:
     print("  EVALUATION RESULTS")
     print("=" * 60)
 
-    for split_name, X, y in [
-        ("TRAIN (in-sample — expect high)",   train_X, split.train_y),
-        ("VALIDATION (out-of-sample)",         val_X,   split.val_y),
-        ("TEST (final holdout — trust this)", test_X,  split.test_y),
+    _split_log: dict[str, dict] = {}
+    for split_name, X, y, _key in [
+        ("TRAIN (in-sample — expect high)",   train_X, split.train_y, "train"),
+        ("VALIDATION (out-of-sample)",         val_X,   split.val_y,   "val"),
+        ("TEST (final holdout — trust this)", test_X,  split.test_y,  "test"),
     ]:
         m, bt = _evaluate_split(split_name, X, y, booster, cfg)
         print_split_eval(split_name, m, bt)
+        _split_log[_key] = {
+            "auc":      round(m.roc_auc, 4),
+            "log_loss": round(m.log_loss, 4),
+            "brier":    round(m.brier_score, 4),
+            "roi":      round(bt.roi, 4),
+            "sharpe":   round(bt.sharpe_ratio, 3),
+            "trades":   bt.total_trades,
+            "win_rate": round(bt.win_rate, 4),
+        }
 
     # Full evaluation printout for test set (includes equity curve + calibration)
     print("\n\n  === FULL TEST SET REPORT ===")
@@ -314,6 +330,23 @@ def main() -> None:
     for i, (name, imp) in enumerate(fi, 1):
         bar = "█" * int(imp / max_imp * 30)
         print(f"    {i:>2}. {name:<35}  {imp:>10.0f}  {bar}")
+
+    # ── Results log ────────────────────────────────────────────
+    if args.log_file:
+        _log_entry: dict = {
+            "type":        "model",
+            "ts":          datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "model":       args.model,
+            "trades":      args.trades,
+            "threshold":   args.entry_threshold,
+            "fwd_buckets": args.forward_window,
+        }
+        for _k, _d in _split_log.items():
+            for _m, _v in _d.items():
+                _log_entry[f"{_k}_{_m}"] = _v
+        append_to_log(args.log_file, _log_entry)
+        print(f"\n  Results appended to: {args.log_file}")
+        print_log_history(args.log_file)
 
     # ── Cleanup ────────────────────────────────────────────────
     if not args.keep_intermediates:
