@@ -33,6 +33,8 @@ import sys
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+import sqlite3
+
 import numpy as np
 import polars as pl
 import lightgbm as lgb
@@ -91,6 +93,52 @@ def fetch_trades(token_id: str, limit: int = 1000) -> list[dict]:
         trades = data
 
     return trades
+
+
+def fetch_trades_from_db(
+    db_path: str,
+    token_id: str,
+    since_unix: int,
+) -> pl.DataFrame:
+    """
+    Read recent trades from the SQLite database written by collect_trades.py.
+
+    Returns a normalised Polars DataFrame (same schema as parse_trades).
+    """
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    rows = conn.execute(
+        """SELECT timestamp, price, usd_amount, token_amount, is_yes
+           FROM trades
+           WHERE token_id = ? AND timestamp >= ?
+           ORDER BY timestamp ASC""",
+        (token_id, since_unix),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return pl.DataFrame(schema={
+            "timestamp": pl.Datetime("us"),
+            "price": pl.Float64,
+            "usd_amount": pl.Float64,
+            "token_amount": pl.Float64,
+            "is_yes": pl.Boolean,
+        })
+
+    df = pl.DataFrame(
+        {
+            "timestamp": [r[0] for r in rows],
+            "price": [r[1] for r in rows],
+            "usd_amount": [r[2] for r in rows],
+            "token_amount": [r[3] for r in rows],
+            "is_yes": [bool(r[4]) for r in rows],
+        }
+    ).with_columns(
+        pl.from_epoch(pl.col("timestamp"), time_unit="s")
+        .cast(pl.Datetime("us"))
+        .alias("timestamp")
+    )
+
+    return df
 
 
 def fetch_market_info(token_id: str) -> dict:
@@ -467,7 +515,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--history-buckets", type=int, default=MIN_HISTORY_BUCKETS,
-        help="How many past 5-min buckets to fetch (default: 60 = 5 hours).",
+        help="How many past 5-min buckets to use (default: 60 = 5 hours).",
+    )
+    parser.add_argument(
+        "--db", default=None,
+        help="Path to SQLite DB from collect_trades.py. "
+             "If given, reads history from DB instead of the live API.",
     )
     parser.add_argument(
         "--verbose", action="store_true",
@@ -506,25 +559,37 @@ def main() -> None:
     else:
         print("  Warning: no market metadata found — some features will be NaN")
 
-    # 3. Fetch recent trades
-    print(f"[3/5] Fetching recent trades (last ~{args.history_buckets * BUCKET_MINUTES} min)...")
-    raw_trades = fetch_trades(args.token_id, limit=min(args.history_buckets * 20, 2000))
-    print(f"  API returned {len(raw_trades)} raw trades")
-
-    trades = parse_trades(raw_trades, args.token_id)
-
-    if trades.is_empty():
-        print("ERROR: No trades found. Check the token ID and try again.")
-        sys.exit(2)
-
-    # Filter to the lookback window we need
+    # 3. Load recent trades (from SQLite DB or live API)
     cutoff = now - timedelta(minutes=args.history_buckets * BUCKET_MINUTES)
-    trades = trades.filter(pl.col("timestamp") >= cutoff)
-    print(f"  Trades in window: {len(trades)}")
+    cutoff_unix = int(cutoff.replace(tzinfo=timezone.utc).timestamp())
 
-    if len(trades) == 0:
-        print("ERROR: No trades in the lookback window. Market may be inactive.")
-        sys.exit(2)
+    if args.db:
+        print(f"[3/5] Reading trades from DB ({args.db})...")
+        trades = fetch_trades_from_db(args.db, args.token_id, cutoff_unix)
+        print(f"  Trades in window: {len(trades)}")
+        if trades.is_empty():
+            print("ERROR: No trades in DB for this token / time window.")
+            print("       Start collect_trades.py first and wait for data to accumulate.")
+            sys.exit(2)
+    else:
+        print(f"[3/5] Fetching live trades from CLOB API "
+              f"(last ~{args.history_buckets * BUCKET_MINUTES} min)...")
+        raw_trades = fetch_trades(args.token_id, limit=min(args.history_buckets * 20, 2000))
+        print(f"  API returned {len(raw_trades)} raw trades")
+
+        trades = parse_trades(raw_trades, args.token_id)
+
+        if trades.is_empty():
+            print("ERROR: No trades found. Check the token ID and try again.")
+            sys.exit(2)
+
+        trades = trades.filter(pl.col("timestamp") >= cutoff)
+        print(f"  Trades in window: {len(trades)}")
+
+        if len(trades) == 0:
+            print("ERROR: No trades in the lookback window. Market may be inactive.")
+            print("       Use --db with collect_trades.py for low-activity markets.")
+            sys.exit(2)
 
     # 4. Aggregate & build features
     print("[4/5] Aggregating and building features...")
@@ -543,13 +608,35 @@ def main() -> None:
     X = get_feature_row(featured, booster)
     p_win = float(booster.predict(X)[0])
 
-    # Decision
+    # --- Determine WHICH SIDE the model's P(win) refers to ---
+    #
+    # During training (labeling.py):
+    #   yes_ratio > 0.5  →  bucket is predominantly YES buys
+    #                        win=1 means price went UP   → good for YES holders
+    #   yes_ratio <= 0.5 →  bucket is predominantly NO  buys
+    #                        win=1 means price went DOWN → good for NO holders
+    #
+    # So P(win) = probability that the DOMINANT side in the last bucket wins.
+    # We must show the user which side that is.
+
+    last_bucket = featured.tail(1)
+    yes_ratio_val = last_bucket["yes_ratio"][0]
+    if yes_ratio_val is None:
+        yes_ratio_val = 0.5  # unknown → treat as neutral
+
+    dominant_side = "YES" if yes_ratio_val > 0.5 else "NO"
     bid = p_win >= args.threshold
 
     print(f"\n{'='*55}")
-    print(f"  P(win)    : {p_win:.4f}  ({p_win:.1%})")
-    print(f"  Threshold : {args.threshold:.1%}")
-    print(f"  Decision  : {'*** BID ***' if bid else 'NO BID'}")
+    print(f"  Current bucket yes_ratio : {yes_ratio_val:.2f}")
+    print(f"  Dominant side            : {dominant_side} "
+          f"({'price must rise' if dominant_side == 'YES' else 'price must fall'} to win)")
+    print(f"  P(win) for {dominant_side:<3s}          : {p_win:.4f}  ({p_win:.1%})")
+    print(f"  Threshold                : {args.threshold:.1%}")
+    if bid:
+        print(f"  Decision  : *** BID {dominant_side} ***")
+    else:
+        print(f"  Decision  : NO BID  (P(win) too low)")
     print(f"{'='*55}\n")
 
     if args.verbose:
