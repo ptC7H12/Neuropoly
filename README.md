@@ -19,6 +19,7 @@ markets.csv + orderFilled.csv
         |
         v
 [3] evaluate_model.py           model.txt gegen historische Daten pruefen (kein Neutraining)
+    benchmark_strategies.py     Klassische Strategien auf denselben Daten vergleichen
         |
         v
 [4] collect_trades.py           Daemon: Live-Trades laufend in SQLite speichern
@@ -242,6 +243,72 @@ Erwartete Ausgabe:
 
 ---
 
+## Phase 2b — Klassische Strategien benchmarken (kein Modell noetig)
+
+Testet 7 klassische Trading-Techniken auf denselben historischen Daten.
+Laeuft die gleiche Preprocessing-Pipeline wie `evaluate_model.py` und gibt
+die gleiche Ausgabe — damit das ML-Modell direkt mit Regelstrategien verglichen werden kann.
+
+```bash
+python benchmark_strategies.py \
+    --trades data/trades.parquet \
+    --markets data/markets.parquet
+```
+
+Mit angepasstem Backtest-Schwellenwert:
+
+```bash
+python benchmark_strategies.py \
+    --trades data/trades.parquet \
+    --markets data/markets.parquet \
+    --entry-threshold 0.55
+```
+
+Erwartete Ausgabe (Vergleichstabelle auf dem TEST-Split):
+
+```
+  Strategy         Dir     Cover     AUC   Brier  WinRate      ROI  Sharpe  Trades
+  ---------------------------------------------------------------------------------
+  baseline         follow  100.0%  0.5000  0.249   51.2%    -4.0%   -0.12   45823
+  random           follow  100.0%  0.5001  0.250   51.2%    -5.1%   -0.15   18350
+  momentum         follow   34.5%  0.5312  0.246   53.4%    +4.2%    0.71     892
+  reversion        AGAINST  12.3%  0.5187  0.248   52.1%    +2.1%    0.31     123
+  volume           follow    8.2%  0.5421  0.243   55.7%    +6.8%    1.12     234
+  closing          follow    5.1%  0.5634  0.238   58.9%    +9.2%    1.41      67
+  contrarian       AGAINST  18.7%  0.5023  0.251   51.3%    +1.5%    0.22     456
+```
+
+**Strategien im Ueberblick:**
+
+| Strategie | Richtung | Hypothese |
+|---|---|---|
+| `baseline` | follow | Immer dominante Seite wetten (keine Filterung, Referenzpunkt) |
+| `random` | follow | Zufaellige Gebote (Untergrenze, erwarteter ROI ≈ -2×Fee) |
+| `momentum` | follow | Kurzzeitige Preisbewegung setzt sich fort (Herdenverhalten) |
+| `reversion` | AGAINST | Ueberdehnter Preis kehrt zum 24-Bucket-Mittelwert zurueck |
+| `volume` | follow | Ungewoehnlich hohes Volumen = Smart Money, Richtung folgen |
+| `closing` | follow | Nahe Markt-Ende konvergieren Preise zur echten Wahrscheinlichkeit |
+| `contrarian` | AGAINST | Wenn yes_ratio UND Preis beide extrem sind — gegen die Masse wetten |
+
+**Dir=follow** benutzt das originale `win`-Label (Wette MIT der Marktmehrheit).
+**Dir=AGAINST** flippt das Label — ROI > 0 bedeutet: die Masse liegt systematisch falsch.
+
+### benchmark_strategies.py CLI-Parameter
+
+| Parameter | Default | Beschreibung |
+|---|---|---|
+| `--trades` | `data/trades.parquet` | Pfad zu Trades-Daten |
+| `--markets` | `data/markets.parquet` | Pfad zu Markets-Daten |
+| `--trades-format` | `parquet` | `csv`, `parquet`, `sqlite` |
+| `--markets-format` | `parquet` | `csv`, `parquet`, `sqlite` |
+| `--entry-threshold` | `0.6` | Backtest-Einstiegsschwelle (gleich wie evaluate_model.py) |
+| `--bucket-minutes` | `5` | Bucket-Groesse in Minuten |
+| `--forward-window` | `6` | Label-Fenster in Buckets (6 = 30 Min) |
+| `--seed` | `42` | Zufalls-Seed fuer die Random-Strategie |
+| `--keep-intermediates` | — | Zwischenparquet-Dateien behalten |
+
+---
+
 ## Phase 3 — Live-Gebote pruefen
 
 ### Schritt 3.1: Token-ID herausfinden
@@ -353,7 +420,8 @@ Neuropoly/
 ├── run_pipeline.py         [Phase 1] Komplette Pipeline inkl. Training
 ├── train_chunked.py        [Phase 1] Inkrementelles Training (~25 GB RAM)
 │
-├── evaluate_model.py       [Phase 2] Modell auswerten ohne Neutraining
+├── evaluate_model.py       [Phase 2]  Modell auswerten ohne Neutraining
+├── benchmark_strategies.py [Phase 2b] Klassische Strategien vs. Modell vergleichen
 │
 ├── collect_trades.py       [Phase 3] Daemon: Live-Trades → SQLite
 ├── live_bid.py             [Phase 3] Live-Gebot pruefen mit model.txt
