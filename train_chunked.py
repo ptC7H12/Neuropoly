@@ -50,8 +50,8 @@ from pipeline.gap_handler import (
     detect_consecutive_gaps,
     apply_gap_exclusions,
 )
-from pipeline.features import build_features, get_feature_columns
-from pipeline.labeling import add_labels, label_stats
+from pipeline.features import build_features_streaming, get_feature_columns
+from pipeline.labeling import add_labels_streaming, label_stats_lazy
 from pipeline.model import predict, feature_importance
 from pipeline.evaluation import evaluate, backtest, print_evaluation
 
@@ -145,15 +145,23 @@ def _process_chunk(
                                           output_path="_chunk_filled_gaps.parquet")
     filled_path = apply_gap_exclusions(filled_path, cfg.gap,
                                        output_path="_chunk_filled_final.parquet")
-    filled = pl.scan_parquet(filled_path).collect()
 
-    # Features
-    featured = build_features(filled, markets_df, cfg.features)
-    feature_cols = get_feature_columns(featured)
+    # Features — streaming, one market at a time, O(1) peak RAM
+    features_path = build_features_streaming(
+        filled_path, markets_df, cfg.features,
+        output_path="_chunk_features.parquet",
+    )
+    gc.collect()
 
-    # Labels
-    labeled = add_labels(featured, cfg.label)
-    stats = label_stats(labeled)
+    # Labels — streaming, one market at a time, O(1) peak RAM
+    labeled_path = add_labels_streaming(
+        features_path, cfg.label,
+        output_path="_chunk_labeled.parquet",
+    )
+    gc.collect()
+
+    # Stats — single lazy aggregation pass, no full collect
+    stats = label_stats_lazy(labeled_path)
     print(
         f"    Rows: {stats['total_rows']:,} | "
         f"Labeled: {stats['labeled']:,} | "
@@ -163,11 +171,20 @@ def _process_chunk(
     if stats["labeled"] == 0:
         return None
 
-    # Trim context: keep only rows from chunk_start_actual onwards for training
-    trainable = labeled.filter(
-        (pl.col("bucket_time") >= chunk_start_actual) &
-        pl.col("win").is_not_null() &
-        (~pl.col("exclude_from_training"))
+    # Determine feature columns from schema (no full load)
+    feature_cols = get_feature_columns(
+        pl.scan_parquet(labeled_path).collect_schema()
+    )
+
+    # Trim context and load only the trainable rows (lazy filter → collect)
+    trainable = (
+        pl.scan_parquet(labeled_path)
+        .filter(
+            (pl.col("bucket_time") >= chunk_start_actual) &
+            pl.col("win").is_not_null() &
+            (~pl.col("exclude_from_training"))
+        )
+        .collect()
     )
 
     if trainable.height == 0:
