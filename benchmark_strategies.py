@@ -40,9 +40,11 @@ Usage
 
 import argparse
 import gc
+import json
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -64,6 +66,7 @@ from pipeline.features import build_features_streaming, get_feature_columns
 from pipeline.labeling import add_labels_streaming, label_stats_lazy
 from pipeline.splitter import walk_forward_split, print_split_info
 from pipeline.evaluation import evaluate, backtest, EvalMetrics, BacktestResult
+from pipeline.results_logger import append_to_log, print_log_history
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +94,9 @@ def parse_args() -> argparse.Namespace:
                    help="Random seed for 'random' baseline strategy")
     p.add_argument("--keep-intermediates", action="store_true",
                    help="Keep temp Parquet files after run")
+    p.add_argument("--log-file", default="results_log.jsonl", metavar="PATH",
+                   help="JSONL file to append results to for historical tracking "
+                        "(default: results_log.jsonl). Pass '' to disable.")
     return p.parse_args()
 
 
@@ -708,6 +714,28 @@ def main() -> None:
         "\n\n  AGAINST strategies are profitable if ROI > 0 — meaning the market"
         "\n    systematically overreacts and contrarian bets recover money."
     )
+
+    # -- Results log ---------------------------------------------------------
+    if args.log_file:
+        _log_entry: dict = {
+            "type":        "bench",
+            "ts":          datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "trades":      args.trades,
+            "threshold":   args.entry_threshold,
+            "fwd_buckets": args.forward_window,
+            "n_test":      n_test,
+        }
+        for r in results:
+            if not r.error and r.bt is not None:
+                _log_entry[f"{r.name}_auc"]    = round(r.metrics.roc_auc, 4)
+                _log_entry[f"{r.name}_roi"]    = round(r.bt.roi, 4)
+                _log_entry[f"{r.name}_sharpe"] = round(r.bt.sharpe_ratio, 3)
+                _log_entry[f"{r.name}_trades"] = r.bt.total_trades
+            else:
+                _log_entry[f"{r.name}_roi"] = None
+        append_to_log(args.log_file, _log_entry)
+        print(f"\n  Results appended to: {args.log_file}")
+        print_log_history(args.log_file)
 
     # -- Cleanup -------------------------------------------------------------
     if not args.keep_intermediates:

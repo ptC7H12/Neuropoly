@@ -306,6 +306,36 @@ Erwartete Ausgabe (Vergleichstabelle auf dem TEST-Split):
 | `--forward-window` | `6` | Label-Fenster in Buckets (6 = 30 Min) |
 | `--seed` | `42` | Zufalls-Seed fuer die Random-Strategie |
 | `--keep-intermediates` | — | Zwischenparquet-Dateien behalten |
+| `--log-file` | `results_log.jsonl` | JSONL-Log fuer historischen Vergleich (s.u.) |
+
+### Historisches Ergebnis-Log (`results_log.jsonl`)
+
+Jeder Lauf von `evaluate_model.py` **und** `benchmark_strategies.py` haengt automatisch
+eine Zeile an `results_log.jsonl` an. Am Ende jedes Laufs erscheint eine kompakte
+Vergleichstabelle aller bisherigen Laeufe — so sieht man sofort, ob sich das Modell
+oder die Strategien verbessert haben.
+
+```
+  ──────────────────────────────────────────────────────────────────────────────
+  Model history  (3 of 3 shown)
+  ──────────────────────────────────────────────────────────────────────────────
+  Timestamp              Model             Thr  TestAUC   TestROI  Sharpe  Trades
+  ─────────────────────  ────────────────  ───  ───────  ────────  ──────  ──────
+  2024-01-10T08:12:00Z   model_v1.txt      60%   0.5721    +8.4%    0.92     312
+  2024-01-15T14:23:00Z   model_v2.txt      60%   0.5873   +14.3%    1.81     432
+  2024-01-20T09:05:00Z   model_v3.txt      60%   0.6012   +17.1%    2.05     518
+```
+
+Das Log wird im JSONL-Format gespeichert (eine JSON-Zeile pro Lauf) und laesst sich
+direkt mit Python/pandas/polars lesen:
+
+```python
+import polars as pl
+log = pl.read_ndjson("results_log.jsonl")
+log.filter(pl.col("type") == "model").select(["ts", "test_auc", "test_roi", "test_sharpe"])
+```
+
+Logging deaktivieren: `--log-file ''`
 
 ---
 
@@ -506,6 +536,7 @@ Neuropoly/
 | `--forward-window` | `6` | Label-Fenster (muss mit Training uebereinstimmen) |
 | `--low-memory` | — | Kleineres Feature-Set |
 | `--keep-intermediates` | — | Zwischenparquet-Dateien behalten |
+| `--log-file` | `results_log.jsonl` | JSONL-Log fuer historischen Vergleich (s.u.) |
 
 ### collect_trades.py
 
