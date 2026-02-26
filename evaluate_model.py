@@ -55,10 +55,10 @@ from pipeline.gap_handler import (
     detect_consecutive_gaps,
     apply_gap_exclusions,
 )
-from pipeline.features import build_features_streaming, get_feature_columns
-from pipeline.labeling import add_labels_streaming, label_stats_lazy
+from pipeline.features import build_features, get_feature_columns
+from pipeline.labeling import add_labels
 from pipeline.model import load_model, predict, feature_importance
-from pipeline.splitter import walk_forward_split, print_split_info
+from pipeline.splitter import SplitResult, walk_forward_split, print_split_info
 from pipeline.evaluation import evaluate, backtest, print_evaluation, EvalMetrics, BacktestResult
 from pipeline.results_logger import append_to_log, print_log_history
 
@@ -185,8 +185,6 @@ def main() -> None:
     _tmp.mkdir(exist_ok=True)
     bucketed_path  = str(_tmp / "bucketed.parquet")
     filled_path    = str(_tmp / "filled.parquet")
-    features_path  = str(_tmp / "features.parquet")
-    labeled_path   = str(_tmp / "labeled.parquet")
 
     # ── Step 1: Load data ──────────────────────────────────────
     print("\n[1/6] Loading data...")
@@ -223,32 +221,121 @@ def main() -> None:
     n_excluded = stats_lf.filter(pl.col("exclude_from_training")).select(pl.len()).collect()[0, 0]
     print(f"  Rows: {n_total:,}  |  Excluded: {n_excluded:,}")
 
-    # ── Step 4: Features ───────────────────────────────────────
-    print("\n[4/6] Engineering features (streaming)...")
-    features_path = build_features_streaming(filled_path, markets_df, cfg.features,
-                                             output_path=str(_tmp / "features.parquet"))
-    _schema = pl.scan_parquet(features_path).limit(0).collect()
-    feature_cols = get_feature_columns(_schema)
-    del _schema
+    # ── Steps 4–6: Features → Labels → Split (single streaming pass) ──
+    # Process one market at a time to avoid loading the full dataset.
+    print("\n[4/6] Features + labels (streaming, one market at a time)...")
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(filled_path)
+    n_rg = pf.metadata.num_row_groups
+
+    feature_cols: list[str] | None = None
+    X_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    time_parts: list[np.ndarray] = []
+    total_rows = 0
+    total_labeled = 0
+    total_wins = 0
+
+    for rg_idx in range(n_rg):
+        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+
+        featured = build_features(market_df, markets_df, cfg.features)
+        del market_df
+
+        if feature_cols is None:
+            feature_cols = get_feature_columns(featured)
+
+        labeled = add_labels(featured, cfg.label)
+        del featured
+
+        total_rows += labeled.height
+        n_lab = labeled["win"].is_not_null().sum()
+        total_labeled += n_lab
+        if n_lab > 0:
+            total_wins += (labeled["win"] == 1).sum()
+
+        trainable = labeled.filter(
+            pl.col("win").is_not_null()
+            & ~pl.col("exclude_from_training").fill_null(False)
+        )
+        del labeled
+
+        if trainable.height > 0:
+            X_parts.append(
+                trainable.select(feature_cols).to_numpy().astype(np.float32)
+            )
+            y_parts.append(trainable["win"].to_numpy().astype(np.float32))
+            time_parts.append(
+                trainable["bucket_time"].to_physical().to_numpy()
+            )
+        del trainable
+
+        if (rg_idx + 1) % 500 == 0 or (rg_idx + 1) == n_rg:
+            gc.collect()
+            print(f"    process: {rg_idx + 1}/{n_rg} markets", flush=True)
+
+    del pf
+    gc.collect()
+
+    win_rate = total_wins / total_labeled if total_labeled > 0 else 0.0
+    print(f"  Rows: {total_rows:,}  |  Labeled: {total_labeled:,}  |  Win rate: {win_rate:.3f}")
     print(f"  {len(feature_cols)} feature columns")
 
-    # ── Step 5: Labels ─────────────────────────────────────────
-    print(f"\n[5/6] Generating labels (forward {cfg.label.forward_window_buckets} buckets = "
-          f"{cfg.label.forward_window_buckets * cfg.bucket.bucket_minutes} min)...")
-    labeled_path = add_labels_streaming(features_path, cfg.label,
-                                        output_path=str(_tmp / "labeled.parquet"))
-    lstats = label_stats_lazy(labeled_path)
-    print(f"  Labeled: {lstats['labeled']:,}  |  Win rate: {lstats['win_rate']:.3f}")
+    if not X_parts:
+        print("ERROR: No trainable rows. Check data / config.")
+        sys.exit(1)
 
-    # ── Step 6: Split ──────────────────────────────────────────
+    X_all = np.concatenate(X_parts)
+    y_all = np.concatenate(y_parts)
+    times_us = np.concatenate(time_parts)
+    del X_parts, y_parts, time_parts
+    gc.collect()
+    print(f"  Trainable rows: {len(y_all):,}")
+
+    # ── Step 5: Sort by time ──────────────────────────────────
+    print("\n[5/6] Sorting by time for walk-forward split...")
+    sort_idx = np.argsort(times_us, kind="mergesort")
+    X_all = X_all[sort_idx]
+    y_all = y_all[sort_idx]
+    del times_us, sort_idx
+    gc.collect()
+
+    # ── Step 6: Walk-forward split (on numpy arrays) ──────────
     print("\n[6/6] Walk-forward split...")
-    labeled = (
-        pl.scan_parquet(labeled_path)
-        .filter(pl.col("win").is_not_null())
-        .collect()
+    n = len(y_all)
+    n_train = int(n * cfg.split.train_ratio)
+    n_val = int(n * cfg.split.val_ratio)
+    gap = cfg.split.split_gap_buckets
+    purge = cfg.label.forward_window_buckets
+
+    train_end_idx = n_train - purge
+    val_start_idx = n_train + gap
+    val_end_idx = val_start_idx + n_val - purge
+    test_start_idx = val_end_idx + gap
+
+    if test_start_idx >= n:
+        gap = max(1, gap // 2)
+        purge = max(1, purge // 2)
+        train_end_idx = n_train - purge
+        val_start_idx = n_train + gap
+        val_end_idx = val_start_idx + n_val - purge
+        test_start_idx = val_end_idx + gap
+
+    if test_start_idx >= n:
+        print(f"ERROR: Dataset too small for split ({n} rows, need >= {test_start_idx + 1}).")
+        sys.exit(1)
+
+    split = SplitResult(
+        train_X=X_all[:train_end_idx],
+        train_y=y_all[:train_end_idx],
+        val_X=X_all[val_start_idx:val_end_idx],
+        val_y=y_all[val_start_idx:val_end_idx],
+        test_X=X_all[test_start_idx:],
+        test_y=y_all[test_start_idx:],
+        feature_names=feature_cols,
     )
-    split = walk_forward_split(labeled, feature_cols, cfg.split, cfg.label)
-    del labeled
+    del X_all, y_all
     gc.collect()
     print_split_info(split)
 
