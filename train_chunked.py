@@ -50,8 +50,8 @@ from pipeline.gap_handler import (
     detect_consecutive_gaps,
     apply_gap_exclusions,
 )
-from pipeline.features import build_features_streaming, get_feature_columns
-from pipeline.labeling import add_labels_streaming, label_stats_lazy
+from pipeline.features import build_features, get_feature_columns
+from pipeline.labeling import add_labels
 from pipeline.model import predict, feature_importance
 from pipeline.evaluation import evaluate, backtest, print_evaluation
 
@@ -131,6 +131,12 @@ def _process_chunk(
     Run gap handling, features, and labeling on one chunk.
     Returns (X, y, feature_names) for trainable rows in [chunk_start_actual, end].
     Returns None if no valid rows.
+
+    Memory strategy: gap handling writes streaming Parquet (one row-group
+    per market).  Then a **single** pass reads each row-group, computes
+    features + labels in-memory for that single market, extracts the
+    trainable numpy arrays, and discards the DataFrame — no intermediate
+    Parquet files for features/labels, no repeated Arrow↔Polars churn.
     """
     if chunk_df.height == 0:
         return None
@@ -146,52 +152,79 @@ def _process_chunk(
     filled_path = apply_gap_exclusions(filled_path, cfg.gap,
                                        output_path="_chunk_filled_final.parquet")
 
-    # Features — streaming, one market at a time, O(1) peak RAM
-    features_path = build_features_streaming(
-        filled_path, markets_df, cfg.features,
-        output_path="_chunk_features.parquet",
-    )
-    gc.collect()
+    # ── Single streaming pass: features → labels → extract per market ──
+    import pyarrow.parquet as pq
 
-    # Labels — streaming, one market at a time, O(1) peak RAM
-    labeled_path = add_labels_streaming(
-        features_path, cfg.label,
-        output_path="_chunk_labeled.parquet",
-    )
-    gc.collect()
+    pf = pq.ParquetFile(filled_path)
+    n_rg = pf.metadata.num_row_groups
 
-    # Stats — single lazy aggregation pass, no full collect
-    stats = label_stats_lazy(labeled_path)
-    print(
-        f"    Rows: {stats['total_rows']:,} | "
-        f"Labeled: {stats['labeled']:,} | "
-        f"Win rate: {stats['win_rate']:.3f}"
-    )
+    X_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    feature_cols: list[str] | None = None
+    total_rows = 0
+    total_labeled = 0
+    total_wins = 0
 
-    if stats["labeled"] == 0:
-        return None
+    for rg_idx in range(n_rg):
+        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
 
-    # Determine feature columns from schema (no full load)
-    feature_cols = get_feature_columns(
-        pl.scan_parquet(labeled_path).collect_schema()
-    )
+        # Features (single market — fast, small)
+        featured = build_features(market_df, markets_df, cfg.features)
+        del market_df
 
-    # Trim context and load only the trainable rows (lazy filter → collect)
-    trainable = (
-        pl.scan_parquet(labeled_path)
-        .filter(
-            (pl.col("bucket_time") >= chunk_start_actual) &
-            pl.col("win").is_not_null() &
-            (~pl.col("exclude_from_training"))
+        if feature_cols is None:
+            feature_cols = get_feature_columns(featured)
+
+        # Labels (single market)
+        labeled = add_labels(featured, cfg.label)
+        del featured
+
+        # Accumulate stats
+        total_rows += labeled.height
+        win_not_null = labeled["win"].is_not_null()
+        n_labeled = win_not_null.sum()
+        total_labeled += n_labeled
+        if n_labeled > 0:
+            total_wins += (labeled["win"] == 1).sum()
+
+        # Extract trainable rows for this market
+        trainable = labeled.filter(
+            (pl.col("bucket_time") >= chunk_start_actual)
+            & pl.col("win").is_not_null()
+            & (~pl.col("exclude_from_training"))
         )
-        .collect()
+        del labeled
+
+        if trainable.height > 0:
+            X_parts.append(
+                trainable.select(feature_cols).to_numpy().astype(np.float32)
+            )
+            y_parts.append(trainable["win"].to_numpy().astype(np.float32))
+        del trainable
+
+        if (rg_idx + 1) % 500 == 0 or (rg_idx + 1) == n_rg:
+            gc.collect()
+            print(
+                f"    process: {rg_idx + 1}/{n_rg} markets", flush=True
+            )
+
+    # Release file handle
+    del pf
+
+    win_rate = total_wins / total_labeled if total_labeled > 0 else 0.0
+    print(
+        f"    Rows: {total_rows:,} | "
+        f"Labeled: {total_labeled:,} | "
+        f"Win rate: {win_rate:.3f}"
     )
 
-    if trainable.height == 0:
+    if not X_parts:
         return None
 
-    X = trainable.select(feature_cols).to_numpy().astype(np.float32)
-    y = trainable["win"].to_numpy().astype(np.float32)
+    X = np.concatenate(X_parts)
+    y = np.concatenate(y_parts)
+    del X_parts, y_parts
+    gc.collect()
 
     return X, y, feature_cols
 
