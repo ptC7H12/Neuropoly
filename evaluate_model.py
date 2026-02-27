@@ -298,7 +298,8 @@ def main() -> None:
     sort_idx = np.argsort(times_us, kind="mergesort")
     X_all = X_all[sort_idx]
     y_all = y_all[sort_idx]
-    del times_us, sort_idx
+    times_us = times_us[sort_idx]
+    del sort_idx
     gc.collect()
 
     # ── Step 6: Walk-forward split (on numpy arrays) ──────────
@@ -326,6 +327,17 @@ def main() -> None:
         print(f"ERROR: Dataset too small for split ({n} rows, need >= {test_start_idx + 1}).")
         sys.exit(1)
 
+    # Extract time boundaries before discarding the time array
+    def _us_to_dt(us_val: int):
+        return datetime.fromtimestamp(us_val / 1_000_000, tz=timezone.utc)
+
+    train_end_time = _us_to_dt(times_us[train_end_idx - 1])
+    val_start_time = _us_to_dt(times_us[val_start_idx])
+    val_end_time   = _us_to_dt(times_us[val_end_idx - 1])
+    test_start_time = _us_to_dt(times_us[test_start_idx])
+    del times_us
+    gc.collect()
+
     split = SplitResult(
         train_X=X_all[:train_end_idx],
         train_y=y_all[:train_end_idx],
@@ -334,6 +346,10 @@ def main() -> None:
         test_X=X_all[test_start_idx:],
         test_y=y_all[test_start_idx:],
         feature_names=feature_cols,
+        train_end=train_end_time,
+        val_start=val_start_time,
+        val_end=val_end_time,
+        test_start=test_start_time,
     )
     del X_all, y_all
     gc.collect()
@@ -349,28 +365,47 @@ def main() -> None:
     print(f"  Model features: {len(model_features)}")
     print(f"  Split features: {len(split.feature_names)}")
 
-    # Warn if there is a mismatch
-    missing_in_data = set(model_features) - set(split.feature_names)
-    extra_in_data   = set(split.feature_names) - set(model_features)
-    if missing_in_data:
-        print(f"  WARNING: {len(missing_in_data)} model features not in data "
-              f"(will be NaN): {sorted(missing_in_data)[:5]}{'...' if len(missing_in_data) > 5 else ''}")
-    if extra_in_data:
-        print(f"  INFO: {len(extra_in_data)} data features not used by model "
-              f"(ignored): {sorted(extra_in_data)[:5]}{'...' if len(extra_in_data) > 5 else ''}")
+    # Detect Column_N pattern: model trained without feature names (old code)
+    import re
+    _col_n_pattern = re.compile(r"^Column_\d+$")
+    all_generic = all(_col_n_pattern.match(f) for f in model_features)
 
-    # Align feature arrays to model's expected order (fill missing with NaN)
-    def _align(X: np.ndarray, data_feats: list[str], model_feats: list[str]) -> np.ndarray:
-        feat_idx = {f: i for i, f in enumerate(data_feats)}
-        out = np.full((X.shape[0], len(model_feats)), np.nan, dtype=np.float32)
-        for j, feat in enumerate(model_feats):
-            if feat in feat_idx:
-                out[:, j] = X[:, feat_idx[feat]]
-        return out
+    if all_generic and len(model_features) == len(split.feature_names):
+        print(f"  FIX: Model has generic Column_N names — mapping by position to data features.")
+        # Column_N maps to split.feature_names[N] positionally
+        train_X = split.train_X
+        val_X   = split.val_X
+        test_X  = split.test_X
+        # Use data feature names for reporting
+        model_features = list(split.feature_names)
+    elif all_generic:
+        print(f"  WARNING: Model has generic Column_N names and feature count differs "
+              f"({len(model_features)} vs {len(split.feature_names)}). Cannot map by position — results will be wrong.")
+        train_X = split.train_X[:, :len(model_features)] if split.train_X.shape[1] >= len(model_features) else split.train_X
+        val_X   = split.val_X[:, :len(model_features)] if split.val_X.shape[1] >= len(model_features) else split.val_X
+        test_X  = split.test_X[:, :len(model_features)] if split.test_X.shape[1] >= len(model_features) else split.test_X
+    else:
+        # Normal case: match by name
+        missing_in_data = set(model_features) - set(split.feature_names)
+        extra_in_data   = set(split.feature_names) - set(model_features)
+        if missing_in_data:
+            print(f"  WARNING: {len(missing_in_data)} model features not in data "
+                  f"(will be NaN): {sorted(missing_in_data)[:5]}{'...' if len(missing_in_data) > 5 else ''}")
+        if extra_in_data:
+            print(f"  INFO: {len(extra_in_data)} data features not used by model "
+                  f"(ignored): {sorted(extra_in_data)[:5]}{'...' if len(extra_in_data) > 5 else ''}")
 
-    train_X = _align(split.train_X, split.feature_names, model_features)
-    val_X   = _align(split.val_X,   split.feature_names, model_features)
-    test_X  = _align(split.test_X,  split.feature_names, model_features)
+        def _align(X: np.ndarray, data_feats: list[str], model_feats: list[str]) -> np.ndarray:
+            feat_idx = {f: i for i, f in enumerate(data_feats)}
+            out = np.full((X.shape[0], len(model_feats)), np.nan, dtype=np.float32)
+            for j, feat in enumerate(model_feats):
+                if feat in feat_idx:
+                    out[:, j] = X[:, feat_idx[feat]]
+            return out
+
+        train_X = _align(split.train_X, split.feature_names, model_features)
+        val_X   = _align(split.val_X,   split.feature_names, model_features)
+        test_X  = _align(split.test_X,  split.feature_names, model_features)
 
     # ── Evaluate on all three splits ──────────────────────────
     print("\n" + "=" * 60)
