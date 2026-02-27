@@ -257,11 +257,14 @@ def _train_chunk(
     params: dict,
     n_estimators: int,
     init_model=None,
+    feature_names: list[str] | None = None,   # ← NEU
 ) -> lgb.Booster:
     """Train (or continue training) a LightGBM model on a chunk."""
     dataset = lgb.Dataset(
-        X, label=y,
-        free_raw_data=True,   # release X from RAM after building the dataset
+        X,
+        label=y,
+        feature_name=feature_names if feature_names else "auto",  # ← NEU
+        free_raw_data=True,
     )
 
     callbacks = [lgb.log_evaluation(period=50)]
@@ -270,7 +273,7 @@ def _train_chunk(
         params,
         dataset,
         num_boost_round=n_estimators,
-        init_model=init_model,        # None → fresh start; Booster → warm start
+        init_model=init_model,
         callbacks=callbacks,
     )
 
@@ -380,6 +383,7 @@ def main():
             params=params,
             n_estimators=args.n_estimators,
             init_model=booster,
+            feature_names=feature_names,   # ← NEU
         )
 
         del X, y
