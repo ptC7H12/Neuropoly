@@ -180,16 +180,16 @@ class BacktestConfig:
     fee_rate: float = 0.02
 
     # Max position size (USD)
-    max_position_usd: float = 100.0
+    max_position_usd: float = 10.0
 
     # Use Kelly criterion for sizing
-    kelly_sizing: bool = True
+    kelly_sizing: bool = False
 
     # Kelly fraction cap (max fraction of bankroll per trade)
     kelly_cap: float = 0.25
 
     # Initial bankroll
-    initial_bankroll: float = 10000.0
+    initial_bankroll: float = 100.0
 
 
 @dataclass
