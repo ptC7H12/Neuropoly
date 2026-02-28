@@ -185,12 +185,12 @@ def backtest(
         fee = stake * fee_rate
 
         if actual_win == 1:
-            # Win: get stake back + profit - fee
-            pnl = stake * (1.0 - fee_rate) - fee
+            # Win: Polymarket zahlt 1:1, fee wird auf den Gewinn berechnet
+            pnl = stake * (1.0 - fee_rate)
             winning += 1
         else:
-            # Loss: lose stake + fee
-            pnl = -(stake + fee)
+            # Loss: Einsatz verloren, keine zusätzliche Fee
+            pnl = -stake
             losing += 1
 
         bankroll += pnl
