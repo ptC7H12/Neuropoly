@@ -14,10 +14,12 @@ damit ungueltig und muessen neu erzeugt werden:
 1. **Preise sind jetzt durchgaengig P(YES).** NO-seitige Trades werden beim
    Laden auf `1 - price` umgerechnet (siehe *Preiskonvention* weiter unten).
    `mean_price` bedeutet dadurch etwas anderes als vorher.
-2. **Feature-Set 93 → 92.** `volume` und `liquidity` sind raus (Snapshot-Werte
-   vom Export-Zeitpunkt, also Look-ahead), `cum_volume` ist neu, und
-   `volume_concentration` benutzt jetzt das bis dahin gehandelte Volumen statt
-   des Lifetime-Volumens.
+2. **Feature-Set 93 → 91.** `volume` und `liquidity` sind raus (Snapshot-Werte
+   vom Export-Zeitpunkt, also Look-ahead), und `volume_concentration` teilt
+   jetzt durch das Volumen im laengsten Rolling-Fenster statt durch das
+   Lifetime-Volumen. Der Fenster-Nenner ist bewusst gewaehlt: er ist kausal
+   *und* liefert in `run_pipeline.py` und `train_chunked.py` denselben Wert,
+   weil die Kontext-Buckets eines Chunks ihn abdecken.
 
 Ausserdem sind die ROI-Zahlen aus frueheren Laeufen in `results_log.jsonl`
 nicht mit neuen vergleichbar: der Backtest rechnete mit einer
@@ -267,7 +269,7 @@ Erwartete Ausgabe:
   Win rate   : 61.2%      <- Preis lief in die richtige Richtung
   Profitable : 18.4%      <- davon nach Kosten im Plus
   Mean return: +0.412%    <- pro Trade, vor Kosten
-  ROI        : -8.7%
+  ROI        : -1.6%      <- auf eingesetztes Kapital
   Sharpe     : 0.09       <- pro Trade, nicht annualisiert
 ```
 
@@ -285,8 +287,18 @@ und produzierte dadurch ROI-Zahlen, die um Groessenordnungen zu hoch waren.
 | Win rate | Anteil Trades mit richtiger Preisrichtung | > 50% | — |
 | Profitable | Anteil Trades die **nach Kosten** Geld machten | > 50% | << Win rate = Bewegungen zu klein |
 | Mean return | Mittlere realisierte Rendite pro Trade | > `fee_rate` | < `fee_rate` = strukturell unprofitabel |
-| ROI (Backtest) | Simulierter Gewinn | > 0% | Negativ = Modell taugt nicht |
+| ROI (Backtest) | Gewinn / eingesetztes Kapital | > 0% | Negativ = Modell taugt nicht |
 | Sharpe (pro Trade) | Rendite / Streuung, **nicht** annualisiert | > 0.1 | < 0 = inkonsistente Ergebnisse |
+
+`ROI` ist die Rendite auf das **tatsaechlich eingesetzte Kapital**
+(`Summe PnL / Summe Einsaetze`) und haengt damit weder von `initial_bankroll`
+noch von der Zeilenreihenfolge ab — bei fester Positionsgroesse gilt exakt
+`ROI = Mean return - fee_rate`. Daneben steht `Bankroll growth`: das ist die
+Entwicklung der simulierten Bankroll und haengt sehr wohl von
+`initial_bankroll` und `max_position_usd` ab. Sie ist Kontext fuer die
+Equity-Kurve, **keine** Aussage ueber die Strategie. Reicht die Bankroll
+nicht fuer alle Trades, wird das als `Bankroll exhausted` gemeldet; die
+Trade-Statistiken darueber decken trotzdem jeden qualifizierten Trade ab.
 
 **Win rate und Profitable auseinanderzuhalten ist der wichtigste Teil.**
 Das Label sagt nur, dass der Preis sich um mindestens `min_price_move`
@@ -608,6 +620,7 @@ Neuropoly/
 | `--n-estimators` | `200` | LightGBM-Baeume pro Chunk |
 | `--learning-rate` | `0.05` | Lernrate |
 | `--n-jobs` | `8` | CPU-Kerne |
+| `--context-buckets` | `60` | Vorlauf-Buckets an jeder Chunk-Grenze. **Muss mindestens so gross sein wie das laengste Feature-Fenster** (Default 48), sonst sind Rolling-/Lag-Features an jeder Grenze falsch. `train_chunked.py` warnt. |
 | `--low-memory` | — | Kleineres Modell + weniger Features |
 
 ### evaluate_model.py

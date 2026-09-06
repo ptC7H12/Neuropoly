@@ -46,7 +46,7 @@ def build_features(
     df = _add_market_features(df, markets)
 
     # 4. Cross / relative features
-    df = _add_cross_features(df)
+    df = _add_cross_features(df, cfg)
 
     # 5. Time features
     if cfg.time_features:
@@ -284,7 +284,7 @@ def _add_market_features(df: pl.DataFrame, markets: pl.DataFrame) -> pl.DataFram
     return df
 
 
-def _add_cross_features(df: pl.DataFrame) -> pl.DataFrame:
+def _add_cross_features(df: pl.DataFrame, cfg: FeatureConfig) -> pl.DataFrame:
     """Cross features: relationships between trade and market data."""
 
     # Entry price vs market price
@@ -301,21 +301,30 @@ def _add_cross_features(df: pl.DataFrame) -> pl.DataFrame:
             .alias("trade_size_vs_liquidity"),
         )
 
-    # Volume concentration: bucket volume / volume traded SO FAR.
+    # Volume concentration: this bucket's volume as a share of the volume
+    # traded in the trailing window.
     #
-    # The denominator used to be `volume` from the markets table — the
-    # market's total lifetime volume as of the day the CSV was exported.
-    # For a bucket in 2020 that is a number from the future, and because it
-    # is constant per market it also works as a market-identity feature.
-    # The running sum is the point-in-time equivalent.
-    df = df.with_columns(
-        pl.col("total_usd").cum_sum().over("market_id").alias("cum_volume"),
-    )
-    df = df.with_columns(
-        (pl.col("total_usd") / pl.col("cum_volume"))
-        .fill_nan(None)
-        .alias("volume_concentration"),
-    )
+    # Two denominators were wrong before:
+    #   * `volume` from the markets table — the market's total LIFETIME
+    #     volume as of the CSV export.  For a bucket in 2020 that is a value
+    #     from the future, and being constant per market it also works as a
+    #     market-identity feature.
+    #   * a cumulative sum since the market's first bucket — causal, but not
+    #     chunk-invariant: train_chunked.py rebuilds features per 90-day
+    #     chunk, so the sum restarted at zero every chunk while run_pipeline
+    #     accumulated over the full history.  Same feature name, values
+    #     differing by ~11x on identical buckets.
+    #
+    # A trailing window is causal AND identical in both paths, because
+    # train_chunked reads --context-buckets of history before each chunk.
+    _win = max(cfg.rolling_windows) if cfg.rolling_windows else 1
+    _vol_sum = f"volume_sum{_win}"
+    if _vol_sum in df.columns:
+        df = df.with_columns(
+            (pl.col("total_usd") / pl.col(_vol_sum))
+            .fill_nan(None)
+            .alias("volume_concentration"),
+        )
 
     # Whale ratio weighted by momentum
     if "whale_count" in df.columns:

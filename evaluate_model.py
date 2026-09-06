@@ -163,8 +163,8 @@ def print_split_eval(
         print(f"  Win rate   : {bt.win_rate:.2%}   (price moved the right way)")
         print(f"  Profitable : {bt.profit_rate:.2%}   (after fee)")
         print(f"  Mean return: {bt.mean_trade_return:+.4%} per trade")
-        print(f"  Total PnL  : ${bt.total_pnl:,.2f}")
-        print(f"  ROI        : {bt.roi:.2%}")
+        print(f"  Total PnL  : ${bt.total_pnl:,.2f}  on ${bt.total_staked:,.2f} staked")
+        print(f"  ROI        : {bt.roi:.2%}   (on deployed capital)")
         print(f"  Sharpe     : {bt.sharpe_ratio:.3f}  (per trade)")
         print(f"  Max DD     : ${bt.max_drawdown:,.2f}  ({bt.max_drawdown_pct:.2%})")
         if bt.payoff_model == "binary":
@@ -435,7 +435,9 @@ def main() -> None:
             "auc":       round(m.roc_auc, 4),
             "log_loss":  round(m.log_loss, 4),
             "brier":     round(m.brier_score, 4),
-            "roi":       round(bt.roi, 4),
+            "roi":       round(bt.roi, 6),
+            "roi_bankroll": round(bt.roi_bankroll, 4),
+            "staked":    round(bt.total_staked, 2),
             "sharpe":    round(bt.sharpe_ratio, 3),
             "trades":    bt.total_trades,
             "win_rate":  round(bt.win_rate, 4),

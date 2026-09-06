@@ -108,12 +108,16 @@ def build_live_features(
 
 
 def _truncate(dt: datetime, bucket_minutes: int) -> datetime:
-    """Floor a timestamp to its bucket boundary."""
-    return dt.replace(
-        minute=(dt.minute // bucket_minutes) * bucket_minutes,
-        second=0,
-        microsecond=0,
-    )
+    """
+    Floor a timestamp to its bucket boundary.
+
+    Delegates to the same Polars truncation that builds the buckets in
+    aggregation.py.  Flooring the minute field by hand only agrees with it
+    when bucket_minutes divides 60: Polars truncates from the Unix epoch, so
+    at 7 min it lands on 13:47 where minute-flooring gives 13:42, and at
+    120 min on 12:00 where minute-flooring gives 13:00.
+    """
+    return pl.Series([dt]).dt.truncate(f"{bucket_minutes}m")[0]
 
 
 def history_window(cfg: PipelineConfig, history_buckets: int) -> timedelta:

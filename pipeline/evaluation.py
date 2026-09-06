@@ -52,7 +52,15 @@ class BacktestResult:
     mean_trade_return: float = 0.0
 
     total_pnl: float = 0.0
+    total_staked: float = 0.0
+    # Return on the capital actually deployed (sum of PnL / sum of stakes).
+    # Independent of bankroll size and row order, so it describes the
+    # strategy rather than the funding assumption.
     roi: float = 0.0
+    # Growth of the simulated bankroll.  Depends on initial_bankroll,
+    # max_position_usd and the order the rows happen to be in — read it as
+    # context for the equity curve, not as a measure of the strategy.
+    roi_bankroll: float = 0.0
     sharpe_ratio: float = 0.0          # per trade, NOT annualised
     max_drawdown: float = 0.0
     max_drawdown_pct: float = 0.0
@@ -61,6 +69,8 @@ class BacktestResult:
     # placeholder, only used when no trade returns were supplied.
     payoff_model: str = "return"
     # True if the run stopped early because the bankroll was exhausted
+    # True if the simulated bankroll ran out.  Strategy statistics are still
+    # computed over every qualifying trade; only the equity curve stops.
     ruined: bool = False
 
     # Time series (one entry per EXECUTED trade, not per candidate row)
@@ -197,6 +207,7 @@ def backtest(
     losing = 0
     profitable = 0
     total = 0
+    total_staked = 0.0
     ruined = False
 
     for i in range(len(y_true)):
@@ -211,6 +222,10 @@ def backtest(
 
         # Position sizing
         if kelly_sizing:
+            # Kelly sizes off the running bankroll, so this path cannot
+            # continue once the bankroll is gone.
+            if ruined:
+                break
             # Kelly fraction: f* = (p*b - q) / b
             # For binary outcome with even odds: f* = 2p - 1
             # With fee adjustment
@@ -218,17 +233,21 @@ def backtest(
             q = 1.0 - p_win
             kelly_f = (p_win * b - q) / b
             kelly_f = max(0, min(kelly_f, kelly_cap))
-            stake = bankroll * kelly_f
+            stake = min(bankroll * kelly_f, max_position_usd, bankroll * 0.5)
+            if stake < 1.0 or bankroll < 10.0:
+                ruined = True
+                break
         else:
+            # Fixed sizing: the trade does not depend on the bankroll, so the
+            # strategy statistics must not either.  The old code broke out of
+            # the loop on ruin, which truncated the sample — with the default
+            # bankroll of 100 and a stake of 10 that discarded roughly half
+            # the trades and made win rate, profit rate and Sharpe describe a
+            # prefix of the data instead of the strategy.
             stake = max_position_usd
 
-        stake = min(stake, max_position_usd, bankroll * 0.5)
-
-        if stake < 1.0 or bankroll < 10.0:
-            ruined = True
-            break
-
         total += 1
+        total_staked += stake
         actual_win = y_true[i]
 
         if use_returns:
@@ -252,16 +271,22 @@ def backtest(
         if pnl > 0:
             profitable += 1
 
-        bankroll += pnl
         trade_pnls.append(pnl)
-        equity_curve.append(bankroll)
 
-        # Track drawdown
-        if bankroll > peak:
-            peak = bankroll
-        dd = peak - bankroll
-        if dd > max_dd:
-            max_dd = dd
+        # Bankroll simulation runs alongside the strategy statistics and
+        # freezes once it is exhausted — it drives the equity curve and the
+        # drawdown, nothing else.
+        if not ruined:
+            bankroll += pnl
+            equity_curve.append(bankroll)
+
+            if bankroll > peak:
+                peak = bankroll
+            dd = peak - bankroll
+            if dd > max_dd:
+                max_dd = dd
+            if bankroll < 10.0:
+                ruined = True
 
     # Compute summary statistics
     result = BacktestResult(
@@ -272,8 +297,13 @@ def backtest(
         profitable_trades=profitable,
         profit_rate=profitable / total if total > 0 else 0.0,
         mean_trade_return=float(np.mean(trade_rets)) if trade_rets else 0.0,
-        total_pnl=bankroll - initial_bankroll,
-        roi=(bankroll - initial_bankroll) / initial_bankroll if initial_bankroll > 0 else 0.0,
+        total_pnl=float(np.sum(trade_pnls)) if trade_pnls else 0.0,
+        total_staked=total_staked,
+        roi=(float(np.sum(trade_pnls)) / total_staked) if total_staked > 0 else 0.0,
+        roi_bankroll=(
+            (bankroll - initial_bankroll) / initial_bankroll
+            if initial_bankroll > 0 else 0.0
+        ),
         max_drawdown=max_dd,
         max_drawdown_pct=max_dd / peak if peak > 0 else 0.0,
         payoff_model="return" if use_returns else "binary",
@@ -325,12 +355,15 @@ def print_evaluation(metrics: EvalMetrics, bt: BacktestResult) -> None:
     print(f"    Win rate:         {bt.win_rate:.2%}   (price moved the right way)")
     print(f"    Profitable:       {bt.profit_rate:.2%}   (after {'' if bt.payoff_model == 'binary' else 'the '}fee)")
     print(f"    Mean return/trade:{bt.mean_trade_return:+.4%}")
-    print(f"    Total PnL:        ${bt.total_pnl:,.2f}")
-    print(f"    ROI:              {bt.roi:.2%}")
+    print(f"    Total PnL:        ${bt.total_pnl:,.2f}  on ${bt.total_staked:,.2f} staked")
+    print(f"    ROI on capital:   {bt.roi:.2%}   <- the strategy")
     print(f"    Sharpe (per trade):{bt.sharpe_ratio:.3f}")
     print(f"    Max Drawdown:     ${bt.max_drawdown:,.2f} ({bt.max_drawdown_pct:.2%})")
+    print(f"    Bankroll growth:  {bt.roi_bankroll:.2%}   (depends on "
+          f"initial_bankroll / max_position_usd)")
     if bt.ruined:
-        print("    !! Bankroll exhausted — simulation stopped before the end of the data.")
+        print("    !! Bankroll exhausted — the equity curve stops there. Trade")
+        print("       statistics above still cover every qualifying trade.")
 
     # Mini equity curve
     if bt.equity_curve:

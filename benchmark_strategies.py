@@ -491,6 +491,7 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
         f"  Profit%     → % of trades that made money AFTER the fee\n"
         f"  Ret/Trd     → mean realised return per trade (before the fee)\n"
         f"  AUC/Brier   → ML metrics on the strategy's own win criterion\n"
+        f"  ROI         → PnL / deployed capital — independent of bankroll size\n"
         f"  Sharpe      → per trade, NOT annualised\n"
         f"  Trades      → trades executed in backtest (strategy-entry ≥ {threshold:.0%})"
     )
@@ -526,8 +527,8 @@ def _print_strategy_detail(r: StrategyResult, threshold: float) -> None:
         print(f"  Win rate   : {bt.win_rate:.2%}   (price moved the right way)")
         print(f"  Profitable : {bt.profit_rate:.2%}   (after fee)")
         print(f"  Mean return: {bt.mean_trade_return:+.4%} per trade")
-        print(f"  Total PnL  : ${bt.total_pnl:,.2f}")
-        print(f"  ROI        : {bt.roi:+.2%}")
+        print(f"  Total PnL  : ${bt.total_pnl:,.2f}  on ${bt.total_staked:,.2f} staked")
+        print(f"  ROI        : {bt.roi:+.2%}   (on deployed capital)")
         print(f"  Sharpe     : {bt.sharpe_ratio:.3f}  (per trade)")
         print(f"  Max DD     : ${bt.max_drawdown:,.2f}  ({bt.max_drawdown_pct:.2%})")
 

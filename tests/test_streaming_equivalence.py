@@ -14,6 +14,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 
@@ -90,9 +91,103 @@ def test_batched_streaming_matches_single_market():
         shutil.rmtree(_TMP, ignore_errors=True)
 
 
+def test_features_are_chunk_invariant():
+    """
+    train_chunked.py rebuilds features per time chunk, run_pipeline.py does
+    it once over the full history.  Any feature whose value depends on how
+    far back the frame starts silently differs between the two.
+
+    volume_concentration used to: it divided by a cumulative sum since the
+    market's first bucket, which restarted every chunk (measured: 100 % of
+    buckets differing, cum_volume ~11x apart).  It now divides by the
+    longest rolling window, which the chunk's context rows cover.
+    """
+    from datetime import timedelta
+
+    from pipeline.features import build_features
+
+    cfg = PipelineConfig()
+    cfg.gap.gap_start = datetime(2099, 1, 1)
+    cfg.gap.gap_end = datetime(2099, 2, 1)
+    context = max(cfg.features.rolling_windows) * cfg.bucket.bucket_minutes
+
+    try:
+        _TMP.mkdir(exist_ok=True)
+        trades = generate_synthetic_trades(n_markets=2, trades_per_market=3000)
+        markets = generate_synthetic_markets(n_markets=2)
+        bucketed = pl.read_parquet(
+            aggregate_trades(trades, cfg.bucket, output_path=str(_TMP / "cb.parquet"))
+        )
+        t_min, t_max = bucketed["bucket_time"].min(), bucketed["bucket_time"].max()
+        mid = t_min + (t_max - t_min) / 2
+
+        def _features(frame, tag):
+            p = fill_buckets(frame, cfg.bucket, cfg.gap,
+                             output_path=str(_TMP / f"cf_{tag}.parquet"))
+            p = detect_consecutive_gaps(p, cfg.gap,
+                                        output_path=str(_TMP / f"cg_{tag}.parquet"))
+            p = apply_gap_exclusions(p, cfg.gap,
+                                     output_path=str(_TMP / f"ce_{tag}.parquet"))
+            return build_features(pl.read_parquet(p), markets, cfg.features)
+
+        full = _features(bucketed, "full")
+        chunked = _features(
+            bucketed.filter(
+                pl.col("bucket_time") >= mid - timedelta(minutes=context)
+            ),
+            "chunk",
+        )
+
+        joined = (
+            full.filter(pl.col("bucket_time") >= mid)
+            .select(["market_id", "bucket_time", "volume_concentration"])
+            .join(
+                chunked.filter(pl.col("bucket_time") >= mid)
+                .select(["market_id", "bucket_time", "volume_concentration"]),
+                on=["market_id", "bucket_time"],
+                suffix="_chunked",
+            )
+            .drop_nulls()
+        )
+        assert joined.height > 100, "not enough overlapping buckets to compare"
+
+        a = joined["volume_concentration"].to_numpy()
+        b = joined["volume_concentration_chunked"].to_numpy()
+        # Rolling sums accumulate in a different order, so allow float noise
+        # but nothing beyond it.
+        assert np.allclose(a, b, rtol=1e-9), (
+            f"volume_concentration differs between full and chunked runs: "
+            f"max rel diff {np.max(np.abs(a - b) / np.maximum(np.abs(a), 1e-12)):.3e}"
+        )
+        print(f"  volume_concentration chunk-invariant ({joined.height} buckets)")
+    finally:
+        import shutil
+        shutil.rmtree(_TMP, ignore_errors=True)
+
+
+def test_live_bucket_truncation_matches_polars():
+    """
+    The live path drops the still-open bucket, so its idea of "current
+    bucket" must be the same one aggregation.py builds.  Flooring the
+    minute field by hand only agrees when bucket_minutes divides 60.
+    """
+    from pipeline.live_features import _truncate
+
+    t = datetime(2024, 1, 1, 13, 47, 30)
+    for bucket_minutes in (1, 2, 3, 5, 7, 10, 15, 20, 25, 30, 45, 60, 90, 120, 240):
+        expected = pl.Series([t]).dt.truncate(f"{bucket_minutes}m")[0]
+        assert _truncate(t, bucket_minutes) == expected, (
+            f"bucket_minutes={bucket_minutes}: "
+            f"{_truncate(t, bucket_minutes)} != {expected}"
+        )
+    print("  live bucket truncation matches aggregation for 1-240 min")
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("  streaming batch-equivalence tests")
+    print("  streaming / cross-path consistency tests")
     print("=" * 60)
     test_batched_streaming_matches_single_market()
+    test_features_are_chunk_invariant()
+    test_live_bucket_truncation_matches_polars()
     print("  ALL PASSED")

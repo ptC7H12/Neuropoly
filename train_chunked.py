@@ -339,6 +339,23 @@ def main():
     print(f"  Chunk size: {args.chunk_days} days")
     print(f"  Context:    {args.context_buckets} buckets at each boundary")
 
+    # Every rolling feature at a chunk boundary is computed from the context
+    # rows alone.  Too little context and those rows are silently wrong —
+    # and the chunked run stops matching what run_pipeline.py produces.
+    longest_window = max(
+        max(cfg.features.rolling_windows, default=1),
+        max(cfg.features.lag_buckets, default=1),
+    )
+    if args.context_buckets < longest_window:
+        print(
+            f"\n  WARNING: --context-buckets {args.context_buckets} is below the "
+            f"longest feature window ({longest_window}).\n"
+            f"           Rolling/lag features at every chunk boundary will be "
+            f"wrong, and the\n"
+            f"           result will not match run_pipeline.py. Use "
+            f"--context-buckets {longest_window} or more.\n"
+        )
+
     # ── Chunk loop ────────────────────────────────────────────────
     print("\n[3] Incremental training …\n")
     params = _lgbm_params(args)

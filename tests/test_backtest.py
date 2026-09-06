@@ -1,0 +1,109 @@
+"""
+Backtest invariants.
+
+The headline numbers have to describe the STRATEGY, not the funding
+assumption.  These tests pin that down.
+
+Run with:  python tests/test_backtest.py   (or: pytest tests/)
+"""
+
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from pipeline.evaluation import backtest
+
+
+def _signal(n: int = 3000, seed: int = 0):
+    """A weak but real edge, with realistic sub-percent price moves."""
+    rng = np.random.default_rng(seed)
+    y = rng.integers(0, 2, n).astype(float)
+    ret = np.where(y == 1, rng.normal(0.008, 0.004, n), rng.normal(-0.008, 0.004, n))
+    pred = np.clip(0.5 + (y - 0.5) * 0.3 + rng.normal(0, 0.08, n), 0, 1)
+    return y, pred, ret
+
+
+_KW = dict(entry_threshold=0.55, fee_rate=0.02, max_position_usd=10.0,
+           kelly_sizing=False)
+
+
+def test_strategy_stats_do_not_depend_on_bankroll():
+    """
+    A bankroll too small to fund every trade used to break out of the loop,
+    truncating the sample: with the default bankroll of 100 and a stake of 10
+    that discarded about half the trades, and ROI swung by a factor of 500
+    between bankroll settings while the strategy was identical.
+    """
+    y, pred, ret = _signal()
+
+    results = [
+        backtest(y, pred, trade_returns=ret, initial_bankroll=b, **_KW)
+        for b in (100.0, 100_000.0, 10_000_000.0)
+    ]
+
+    trades = {r.total_trades for r in results}
+    assert len(trades) == 1, f"trade count varies with bankroll: {trades}"
+
+    rois = {round(r.roi, 12) for r in results}
+    assert len(rois) == 1, f"ROI varies with bankroll: {rois}"
+
+    assert len({round(r.win_rate, 12) for r in results}) == 1
+    assert len({round(r.sharpe_ratio, 12) for r in results}) == 1
+
+    # The bankroll simulation itself is still allowed to differ — that is
+    # what roi_bankroll is for.
+    assert results[0].ruined and not results[-1].ruined
+    print(f"  bankroll-independent: {results[0].total_trades} trades, "
+          f"ROI {results[0].roi:+.3%}")
+
+
+def test_roi_is_order_independent():
+    y, pred, ret = _signal()
+    rng = np.random.default_rng(1)
+    perm = rng.permutation(len(y))
+
+    a = backtest(y, pred, trade_returns=ret, initial_bankroll=100.0, **_KW)
+    b = backtest(y[perm], pred[perm], trade_returns=ret[perm],
+                 initial_bankroll=100.0, **_KW)
+
+    assert a.total_trades == b.total_trades
+    assert abs(a.roi - b.roi) < 1e-12, f"{a.roi} != {b.roi}"
+    print(f"  order-independent:    ROI {a.roi:+.3%}")
+
+
+def test_roi_equals_mean_return_minus_fee():
+    """
+    With fixed sizing, ROI on deployed capital must reduce exactly to
+    mean realised return minus the round-trip cost.  A sanity anchor: if
+    this drifts, the PnL formula changed.
+    """
+    y, pred, ret = _signal()
+    bt = backtest(y, pred, trade_returns=ret, initial_bankroll=100.0, **_KW)
+
+    expected = bt.mean_trade_return - _KW["fee_rate"]
+    assert abs(bt.roi - expected) < 1e-9, f"{bt.roi} != {expected}"
+    assert abs(bt.total_staked - bt.total_trades * _KW["max_position_usd"]) < 1e-6
+    print(f"  ROI == mean return - fee: {bt.roi:+.3%} "
+          f"= {bt.mean_trade_return:+.3%} - {_KW['fee_rate']:.1%}")
+
+
+def test_binary_payoff_is_tagged():
+    """Calling without realised returns must be visible in the result."""
+    y, pred, _ = _signal()
+    bt = backtest(y, pred, initial_bankroll=100.0, **_KW)
+    assert bt.payoff_model == "binary"
+    print("  binary payoff tagged")
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  backtest invariants")
+    print("=" * 60)
+    test_strategy_stats_do_not_depend_on_bankroll()
+    test_roi_is_order_independent()
+    test_roi_equals_mean_return_minus_fee()
+    test_binary_payoff_is_tagged()
+    print("  ALL PASSED")
