@@ -58,7 +58,12 @@ from pipeline.gap_handler import (
 from pipeline.features import build_features, get_feature_columns
 from pipeline.labeling import add_labels
 from pipeline.model import load_model, predict, feature_importance
-from pipeline.splitter import SplitResult, walk_forward_split, print_split_info
+from pipeline.splitter import (
+    SplitResult,
+    print_split_info,
+    purge_minutes,
+    time_split_indices,
+)
 from pipeline.evaluation import evaluate, backtest, print_evaluation, EvalMetrics, BacktestResult
 from pipeline.results_logger import append_to_log, print_log_history
 
@@ -116,9 +121,9 @@ def apply_args(cfg: PipelineConfig, args: argparse.Namespace) -> PipelineConfig:
 # ---------------------------------------------------------------------------
 
 def _evaluate_split(
-    name: str,
     X: np.ndarray,
     y: np.ndarray,
+    ret: np.ndarray | None,
     booster,
     cfg: PipelineConfig,
 ) -> tuple[EvalMetrics, BacktestResult]:
@@ -126,7 +131,7 @@ def _evaluate_split(
     y_pred = predict(booster, X)
     metrics = evaluate(y, y_pred, threshold=cfg.backtest.entry_threshold)
     bt = backtest(
-        y, y_pred,
+        y, y_pred, trade_returns=ret,
         entry_threshold=cfg.backtest.entry_threshold,
         fee_rate=cfg.backtest.fee_rate,
         max_position_usd=cfg.backtest.max_position_usd,
@@ -137,7 +142,9 @@ def _evaluate_split(
     return metrics, bt
 
 
-def print_split_eval(name: str, metrics: EvalMetrics, bt: BacktestResult) -> None:
+def print_split_eval(
+    name: str, metrics: EvalMetrics, bt: BacktestResult, threshold: float
+) -> None:
     w = 55
     print(f"\n{'='*w}")
     print(f"  {name.upper()}")
@@ -145,19 +152,23 @@ def print_split_eval(name: str, metrics: EvalMetrics, bt: BacktestResult) -> Non
     print(f"  ROC AUC  : {metrics.roc_auc:.4f}")
     print(f"  Log Loss : {metrics.log_loss:.4f}")
     print(f"  Brier    : {metrics.brier_score:.4f}")
-    print(f"  Accuracy : {metrics.accuracy:.4f}  (threshold {bt.win_rate:.0%})")
+    print(f"  Accuracy : {metrics.accuracy:.4f}  (threshold {threshold:.0%})")
     print(f"  Precision: {metrics.precision:.4f}   Recall: {metrics.recall:.4f}   F1: {metrics.f1:.4f}")
 
-    print(f"\n  --- Backtest (entry >= {bt.win_rate:.0%} threshold) ---")
+    print(f"\n  --- Backtest (entry >= {threshold:.0%} threshold) ---")
     if bt.total_trades == 0:
         print("  No trades triggered (threshold too high or no qualifying predictions).")
     else:
-        print(f"  Trades   : {bt.total_trades}")
-        print(f"  Win rate : {bt.win_rate:.2%}")
-        print(f"  Total PnL: ${bt.total_pnl:,.2f}")
-        print(f"  ROI      : {bt.roi:.2%}")
-        print(f"  Sharpe   : {bt.sharpe_ratio:.2f}")
-        print(f"  Max DD   : ${bt.max_drawdown:,.2f}  ({bt.max_drawdown_pct:.2%})")
+        print(f"  Trades     : {bt.total_trades}")
+        print(f"  Win rate   : {bt.win_rate:.2%}   (price moved the right way)")
+        print(f"  Profitable : {bt.profit_rate:.2%}   (after fee)")
+        print(f"  Mean return: {bt.mean_trade_return:+.4%} per trade")
+        print(f"  Total PnL  : ${bt.total_pnl:,.2f}")
+        print(f"  ROI        : {bt.roi:.2%}")
+        print(f"  Sharpe     : {bt.sharpe_ratio:.3f}  (per trade)")
+        print(f"  Max DD     : ${bt.max_drawdown:,.2f}  ({bt.max_drawdown_pct:.2%})")
+        if bt.payoff_model == "binary":
+            print("  !! binary payoff model — ROI not meaningful")
     print(f"{'='*w}")
 
 
@@ -232,6 +243,7 @@ def main() -> None:
     feature_cols: list[str] | None = None
     X_parts: list[np.ndarray] = []
     y_parts: list[np.ndarray] = []
+    ret_parts: list[np.ndarray] = []
     time_parts: list[np.ndarray] = []
     total_rows = 0
     total_labeled = 0
@@ -266,6 +278,9 @@ def main() -> None:
                 trainable.select(feature_cols).to_numpy().astype(np.float32)
             )
             y_parts.append(trainable["win"].to_numpy().astype(np.float32))
+            ret_parts.append(
+                trainable["trade_return"].to_numpy().astype(np.float64)
+            )
             time_parts.append(
                 trainable["bucket_time"].to_physical().to_numpy()
             )
@@ -288,8 +303,9 @@ def main() -> None:
 
     X_all = np.concatenate(X_parts)
     y_all = np.concatenate(y_parts)
+    ret_all = np.concatenate(ret_parts)
     times_us = np.concatenate(time_parts)
-    del X_parts, y_parts, time_parts
+    del X_parts, y_parts, ret_parts, time_parts
     gc.collect()
     print(f"  Trainable rows: {len(y_all):,}")
 
@@ -298,60 +314,53 @@ def main() -> None:
     sort_idx = np.argsort(times_us, kind="mergesort")
     X_all = X_all[sort_idx]
     y_all = y_all[sort_idx]
+    ret_all = ret_all[sort_idx]
     times_us = times_us[sort_idx]
     del sort_idx
     gc.collect()
 
     # ── Step 6: Walk-forward split (on numpy arrays) ──────────
+    # Uses the same time-based purge as pipeline/splitter.walk_forward_split,
+    # so evaluation boundaries match training boundaries exactly.
     print("\n[6/6] Walk-forward split...")
-    n = len(y_all)
-    n_train = int(n * cfg.split.train_ratio)
-    n_val = int(n * cfg.split.val_ratio)
-    gap = cfg.split.split_gap_buckets
-    purge = cfg.label.forward_window_buckets
-
-    train_end_idx = n_train - purge
-    val_start_idx = n_train + gap
-    val_end_idx = val_start_idx + n_val - purge
-    test_start_idx = val_end_idx + gap
-
-    if test_start_idx >= n:
-        gap = max(1, gap // 2)
-        purge = max(1, purge // 2)
-        train_end_idx = n_train - purge
-        val_start_idx = n_train + gap
-        val_end_idx = val_start_idx + n_val - purge
-        test_start_idx = val_end_idx + gap
-
-    if test_start_idx >= n:
-        print(f"ERROR: Dataset too small for split ({n} rows, need >= {test_start_idx + 1}).")
+    print(f"  Purge between splits: "
+          f"{purge_minutes(cfg.split, cfg.label, cfg.bucket.bucket_minutes)} min")
+    try:
+        tr_sl, va_sl, te_sl = time_split_indices(
+            times_us, cfg.split, cfg.label, cfg.bucket.bucket_minutes
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
         sys.exit(1)
 
     # Extract time boundaries before discarding the time array
     def _us_to_dt(us_val: int):
         return datetime.fromtimestamp(us_val / 1_000_000, tz=timezone.utc)
 
-    train_end_time = _us_to_dt(times_us[train_end_idx - 1])
-    val_start_time = _us_to_dt(times_us[val_start_idx])
-    val_end_time   = _us_to_dt(times_us[val_end_idx - 1])
-    test_start_time = _us_to_dt(times_us[test_start_idx])
+    train_end_time = _us_to_dt(times_us[tr_sl.stop - 1])
+    val_start_time = _us_to_dt(times_us[va_sl.start])
+    val_end_time   = _us_to_dt(times_us[va_sl.stop - 1])
+    test_start_time = _us_to_dt(times_us[te_sl.start])
     del times_us
     gc.collect()
 
     split = SplitResult(
-        train_X=X_all[:train_end_idx],
-        train_y=y_all[:train_end_idx],
-        val_X=X_all[val_start_idx:val_end_idx],
-        val_y=y_all[val_start_idx:val_end_idx],
-        test_X=X_all[test_start_idx:],
-        test_y=y_all[test_start_idx:],
+        train_X=X_all[tr_sl],
+        train_y=y_all[tr_sl],
+        val_X=X_all[va_sl],
+        val_y=y_all[va_sl],
+        test_X=X_all[te_sl],
+        test_y=y_all[te_sl],
         feature_names=feature_cols,
+        train_ret=ret_all[tr_sl],
+        val_ret=ret_all[va_sl],
+        test_ret=ret_all[te_sl],
         train_end=train_end_time,
         val_start=val_start_time,
         val_end=val_end_time,
         test_start=test_start_time,
     )
-    del X_all, y_all
+    del X_all, y_all, ret_all
     gc.collect()
     print_split_info(split)
 
@@ -413,36 +422,31 @@ def main() -> None:
     print("=" * 60)
 
     _split_log: dict[str, dict] = {}
-    for split_name, X, y, _key in [
-        ("TRAIN (in-sample — expect high)",   train_X, split.train_y, "train"),
-        ("VALIDATION (out-of-sample)",         val_X,   split.val_y,   "val"),
-        ("TEST (final holdout — trust this)", test_X,  split.test_y,  "test"),
+    _results: dict[str, tuple] = {}
+    for split_name, X, y, ret, _key in [
+        ("TRAIN (in-sample — expect high)",   train_X, split.train_y, split.train_ret, "train"),
+        ("VALIDATION (out-of-sample)",         val_X,   split.val_y,   split.val_ret,   "val"),
+        ("TEST (final holdout — trust this)", test_X,  split.test_y,  split.test_ret,  "test"),
     ]:
-        m, bt = _evaluate_split(split_name, X, y, booster, cfg)
-        print_split_eval(split_name, m, bt)
+        m, bt = _evaluate_split(X, y, ret, booster, cfg)
+        print_split_eval(split_name, m, bt, cfg.backtest.entry_threshold)
+        _results[_key] = (m, bt)
         _split_log[_key] = {
-            "auc":      round(m.roc_auc, 4),
-            "log_loss": round(m.log_loss, 4),
-            "brier":    round(m.brier_score, 4),
-            "roi":      round(bt.roi, 4),
-            "sharpe":   round(bt.sharpe_ratio, 3),
-            "trades":   bt.total_trades,
-            "win_rate": round(bt.win_rate, 4),
+            "auc":       round(m.roc_auc, 4),
+            "log_loss":  round(m.log_loss, 4),
+            "brier":     round(m.brier_score, 4),
+            "roi":       round(bt.roi, 4),
+            "sharpe":    round(bt.sharpe_ratio, 3),
+            "trades":    bt.total_trades,
+            "win_rate":  round(bt.win_rate, 4),
+            "profit_rate": round(bt.profit_rate, 4),
+            "mean_ret":  round(bt.mean_trade_return, 6),
         }
 
-    # Full evaluation printout for test set (includes equity curve + calibration)
+    # Full evaluation printout for test set (includes equity curve + calibration).
+    # Reuses the results computed above instead of predicting a second time.
     print("\n\n  === FULL TEST SET REPORT ===")
-    test_pred = predict(booster, test_X)
-    test_metrics = evaluate(split.test_y, test_pred, threshold=cfg.backtest.entry_threshold)
-    test_bt = backtest(
-        split.test_y, test_pred,
-        entry_threshold=cfg.backtest.entry_threshold,
-        fee_rate=cfg.backtest.fee_rate,
-        max_position_usd=cfg.backtest.max_position_usd,
-        kelly_sizing=cfg.backtest.kelly_sizing,
-        kelly_cap=cfg.backtest.kelly_cap,
-        initial_bankroll=cfg.backtest.initial_bankroll,
-    )
+    test_metrics, test_bt = _results["test"]
     print_evaluation(test_metrics, test_bt)
 
     # ── Feature importance ─────────────────────────────────────

@@ -208,7 +208,9 @@ def main():
         .filter(pl.col("win").is_not_null())
         .collect()
     )
-    split = walk_forward_split(labeled, feature_cols, cfg.split, cfg.label)
+    split = walk_forward_split(
+        labeled, feature_cols, cfg.split, cfg.label, cfg.bucket.bucket_minutes
+    )
     del labeled
     gc.collect()
     print_split_info(split)
@@ -235,6 +237,7 @@ def main():
     bt = backtest(
         split.test_y,
         y_pred,
+        trade_returns=split.test_ret,
         entry_threshold=cfg.backtest.entry_threshold,
         fee_rate=cfg.backtest.fee_rate,
         max_position_usd=cfg.backtest.max_position_usd,

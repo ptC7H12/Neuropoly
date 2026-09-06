@@ -467,7 +467,7 @@ def _safe_float(v) -> Optional[float]:
 EXCLUDE_COLS = {
     "bucket_time", "market_id", "is_empty_bucket", "in_gap", "in_long_gap",
     "exclude_from_training", "win", "future_return", "future_price",
-    "question", "close_time",
+    "trade_return", "trade_return_opp", "question", "close_time",
 }
 
 

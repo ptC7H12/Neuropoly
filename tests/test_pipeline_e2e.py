@@ -153,7 +153,9 @@ def test_full_pipeline():
 
     # Split
     print("\n[6] Walk-forward split...")
-    split = walk_forward_split(labeled, feature_cols, cfg.split, cfg.label)
+    split = walk_forward_split(
+        labeled, feature_cols, cfg.split, cfg.label, cfg.bucket.bucket_minutes
+    )
     print_split_info(split)
     assert split.train_X.shape[0] > 0, "Train set empty"
     assert split.val_X.shape[0] > 0, "Val set empty"
@@ -174,8 +176,41 @@ def test_full_pipeline():
     from pipeline.evaluation import evaluate, backtest, print_evaluation
 
     metrics = evaluate(split.test_y, y_pred)
-    bt = backtest(split.test_y, y_pred)
+    bt = backtest(
+        split.test_y, y_pred,
+        trade_returns=split.test_ret,
+        entry_threshold=cfg.backtest.entry_threshold,
+        fee_rate=cfg.backtest.fee_rate,
+        max_position_usd=cfg.backtest.max_position_usd,
+        kelly_sizing=cfg.backtest.kelly_sizing,
+        kelly_cap=cfg.backtest.kelly_cap,
+        initial_bankroll=cfg.backtest.initial_bankroll,
+    )
     print_evaluation(metrics, bt)
+
+    # The backtest must use realised price moves, never the even-money
+    # placeholder — otherwise ROI is off by orders of magnitude.
+    assert bt.payoff_model == "return", "Backtest fell back to the binary payoff"
+    assert split.test_ret is not None, "Split did not carry trade returns"
+
+    # No label may leak across a split boundary: the gap between the last
+    # training row and the first validation row must cover the label horizon.
+    from pipeline.splitter import purge_minutes
+    from datetime import timedelta
+    need = timedelta(minutes=purge_minutes(cfg.split, cfg.label, cfg.bucket.bucket_minutes))
+    assert split.val_start - split.train_end >= need, (
+        f"train→val gap {split.val_start - split.train_end} < required {need}"
+    )
+    assert split.test_start - split.val_end >= need, (
+        f"val→test gap {split.test_start - split.val_end} < required {need}"
+    )
+
+    # Realised returns must be economically sane: a 30-minute move on a
+    # prediction market is a few percent, not a few hundred percent.
+    finite = split.test_ret[np.isfinite(split.test_ret)]
+    assert np.abs(finite).mean() < 0.5, (
+        f"mean |trade_return| = {np.abs(finite).mean():.3f} — implausible"
+    )
 
     print("\n  ALL ASSERTIONS PASSED")
     print("=" * 60)

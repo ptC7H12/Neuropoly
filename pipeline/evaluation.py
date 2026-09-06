@@ -44,13 +44,26 @@ class BacktestResult:
     losing_trades: int = 0
     win_rate: float = 0.0
 
+    # Trades that actually made money after costs.  Diverges from win_rate
+    # because `win` only asks whether the price moved the right way, not
+    # whether the move was big enough to cover the fee.
+    profitable_trades: int = 0
+    profit_rate: float = 0.0
+    mean_trade_return: float = 0.0
+
     total_pnl: float = 0.0
     roi: float = 0.0
-    sharpe_ratio: float = 0.0
+    sharpe_ratio: float = 0.0          # per trade, NOT annualised
     max_drawdown: float = 0.0
     max_drawdown_pct: float = 0.0
 
-    # Time series
+    # "return" = realised price move (correct);  "binary" = legacy even-money
+    # placeholder, only used when no trade returns were supplied.
+    payoff_model: str = "return"
+    # True if the run stopped early because the bankroll was exhausted
+    ruined: bool = False
+
+    # Time series (one entry per EXECUTED trade, not per candidate row)
     equity_curve: list[float] = field(default_factory=list)
     trade_pnls: list[float] = field(default_factory=list)
 
@@ -127,6 +140,7 @@ def _add_calibration(
 def backtest(
     y_true: np.ndarray,
     y_pred_proba: np.ndarray,
+    trade_returns: Optional[np.ndarray] = None,
     entry_threshold: float = 0.6,
     fee_rate: float = 0.02,
     max_position_usd: float = 100.0,
@@ -138,27 +152,61 @@ def backtest(
     Simulate trading based on model predictions.
 
     Trading rules:
-    - Enter trade if P(win) > entry_threshold
-    - Position size: Kelly criterion or fixed
-    - Win: +payout - fee
-    - Loss: -stake - fee
+    - Enter a trade if P(win) >= entry_threshold
+    - Position size: fixed, or Kelly (binary payoff model only)
+    - PnL = stake * (realised return - fee_rate)
+
+    `trade_returns` is the realised return of the position over the label's
+    forward window (see pipeline/labeling.py:trade_return).  It is what makes
+    the result economically meaningful: a bucket where the price moves from
+    0.500 to 0.501 is a `win`, but it pays 0.2 % — not 100 %.
+
+    If `trade_returns` is None the function falls back to the old even-money
+    binary payoff (+stake on a win, -stake on a loss).  That model does NOT
+    describe a prediction market and massively overstates ROI; the result is
+    tagged with payoff_model="binary" so callers can flag it.
     """
+
+    use_returns = trade_returns is not None
+    if use_returns:
+        trade_returns = np.asarray(trade_returns, dtype=np.float64)
+        if len(trade_returns) != len(y_true):
+            raise ValueError(
+                f"trade_returns has {len(trade_returns)} rows but y_true has "
+                f"{len(y_true)} — they must be aligned row for row."
+            )
+        if kelly_sizing:
+            # Kelly's f* = 2p - 1 assumes an even-money binary bet.  With real
+            # price returns the payoff is asymmetric and tiny, so that formula
+            # is meaningless here.  Fall back to fixed sizing rather than
+            # invent a number.
+            print(
+                "  NOTE: kelly_sizing is not supported with realised returns "
+                "— using fixed position sizing instead."
+            )
+            kelly_sizing = False
 
     bankroll = initial_bankroll
     equity_curve = [bankroll]
     trade_pnls = []
+    trade_rets = []
     peak = bankroll
     max_dd = 0.0
 
     winning = 0
     losing = 0
+    profitable = 0
     total = 0
+    ruined = False
 
     for i in range(len(y_true)):
         p_win = y_pred_proba[i]
 
         if p_win < entry_threshold:
-            equity_curve.append(bankroll)
+            continue
+
+        # A row without a realised return cannot be traded in the simulation
+        if use_returns and not np.isfinite(trade_returns[i]):
             continue
 
         # Position sizing
@@ -177,21 +225,32 @@ def backtest(
         stake = min(stake, max_position_usd, bankroll * 0.5)
 
         if stake < 1.0 or bankroll < 10.0:
-            equity_curve.append(bankroll)
-            continue
+            ruined = True
+            break
 
         total += 1
         actual_win = y_true[i]
-        fee = stake * fee_rate
+
+        if use_returns:
+            # Realised price move minus round-trip cost (fee + spread proxy),
+            # both as a fraction of the notional stake.
+            ret = float(trade_returns[i])
+            pnl = stake * (ret - fee_rate)
+            trade_rets.append(ret)
+        else:
+            # Legacy even-money model — kept only for backwards compatibility
+            if actual_win == 1:
+                pnl = stake * (1.0 - fee_rate)
+            else:
+                pnl = -stake
+            trade_rets.append(pnl / stake)
 
         if actual_win == 1:
-            # Win: Polymarket zahlt 1:1, fee wird auf den Gewinn berechnet
-            pnl = stake * (1.0 - fee_rate)
             winning += 1
         else:
-            # Loss: Einsatz verloren, keine zusätzliche Fee
-            pnl = -stake
             losing += 1
+        if pnl > 0:
+            profitable += 1
 
         bankroll += pnl
         trade_pnls.append(pnl)
@@ -210,20 +269,26 @@ def backtest(
         winning_trades=winning,
         losing_trades=losing,
         win_rate=winning / total if total > 0 else 0.0,
+        profitable_trades=profitable,
+        profit_rate=profitable / total if total > 0 else 0.0,
+        mean_trade_return=float(np.mean(trade_rets)) if trade_rets else 0.0,
         total_pnl=bankroll - initial_bankroll,
         roi=(bankroll - initial_bankroll) / initial_bankroll if initial_bankroll > 0 else 0.0,
         max_drawdown=max_dd,
         max_drawdown_pct=max_dd / peak if peak > 0 else 0.0,
+        payoff_model="return" if use_returns else "binary",
+        ruined=ruined,
         equity_curve=equity_curve,
         trade_pnls=trade_pnls,
     )
 
-    # Sharpe ratio (annualized, assuming ~288 buckets per day for 5-min)
-    if trade_pnls:
-        pnl_arr = np.array(trade_pnls)
-        if pnl_arr.std() > 0:
-            daily_factor = np.sqrt(288)  # 5-min to daily
-            result.sharpe_ratio = (pnl_arr.mean() / pnl_arr.std()) * daily_factor
+    # Sharpe ratio PER TRADE (mean / std of trade returns).
+    # Deliberately NOT annualised: the backtest has no trade timestamps, so
+    # any scaling factor would be made up.
+    if len(trade_rets) > 1:
+        ret_arr = np.array(trade_rets)
+        if ret_arr.std() > 0:
+            result.sharpe_ratio = float(ret_arr.mean() / ret_arr.std())
 
     return result
 
@@ -253,12 +318,19 @@ def print_evaluation(metrics: EvalMetrics, bt: BacktestResult) -> None:
     print("\n" + "-" * 60)
     print("  BACKTEST RESULTS")
     print("-" * 60)
+    if bt.payoff_model == "binary":
+        print("    !! PAYOFF MODEL: binary (even money) — NOT a prediction market.")
+        print("       No realised returns were supplied; ROI is meaningless here.")
     print(f"    Total trades:     {bt.total_trades}")
-    print(f"    Win rate:         {bt.win_rate:.2%}")
+    print(f"    Win rate:         {bt.win_rate:.2%}   (price moved the right way)")
+    print(f"    Profitable:       {bt.profit_rate:.2%}   (after {'' if bt.payoff_model == 'binary' else 'the '}fee)")
+    print(f"    Mean return/trade:{bt.mean_trade_return:+.4%}")
     print(f"    Total PnL:        ${bt.total_pnl:,.2f}")
     print(f"    ROI:              {bt.roi:.2%}")
-    print(f"    Sharpe Ratio:     {bt.sharpe_ratio:.2f}")
+    print(f"    Sharpe (per trade):{bt.sharpe_ratio:.3f}")
     print(f"    Max Drawdown:     ${bt.max_drawdown:,.2f} ({bt.max_drawdown_pct:.2%})")
+    if bt.ruined:
+        print("    !! Bankroll exhausted — simulation stopped before the end of the data.")
 
     # Mini equity curve
     if bt.equity_curve:

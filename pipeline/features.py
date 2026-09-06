@@ -369,6 +369,8 @@ def get_feature_columns(df) -> list[str]:
         "win",
         "future_return",
         "future_price",
+        "trade_return",
+        "trade_return_opp",
         "question",
         "close_time",
     }

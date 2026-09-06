@@ -123,14 +123,16 @@ class StrategyResult:
 def _run_eval(
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    trade_returns: np.ndarray,
     cfg: PipelineConfig,
 ) -> tuple[EvalMetrics, BacktestResult]:
-    """Evaluate and run backtest on a (y_true, y_pred) pair."""
+    """Evaluate and run backtest on a (y_true, y_pred, trade_returns) triple."""
 
     # Remove NaN / inf
     valid = np.isfinite(y_pred) & np.isfinite(y_true)
     y_true = y_true[valid]
     y_pred = np.clip(y_pred[valid], 1e-7, 1.0 - 1e-7)
+    trade_returns = trade_returns[valid]
 
     if len(y_true) < 10:
         raise ValueError("Too few valid rows for evaluation")
@@ -141,6 +143,7 @@ def _run_eval(
     bt = backtest(
         y_true,
         y_pred,
+        trade_returns=trade_returns,
         entry_threshold=cfg.backtest.entry_threshold,
         fee_rate=cfg.backtest.fee_rate,
         max_position_usd=cfg.backtest.max_position_usd,
@@ -443,6 +446,8 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
         f"{'AUC':>8}"
         f"{'Brier':>7}"
         f"{'WinRate':>8}"
+        f"{'Profit%':>8}"
+        f"{'Ret/Trd':>9}"
         f"{'ROI':>8}"
         f"{'Sharpe':>7}"
         f"{'Trades':>7}"
@@ -465,8 +470,10 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
             f"{m.roc_auc:>7.4f}"
             f"{m.brier_score:>7.4f}"
             f"{bt.win_rate:>7.1%} "
+            f"{bt.profit_rate:>7.1%} "
+            f"{bt.mean_trade_return:>+9.3%}"
             f"{bt.roi:>+8.1%}"
-            f"{bt.sharpe_ratio:>7.2f}"
+            f"{bt.sharpe_ratio:>7.3f}"
             f"{bt.total_trades:>7}"
         )
 
@@ -476,7 +483,11 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
         f"  Dir=AGAINST → strategy bets AGAINST the dominant side        "
         f"(win = flipped label = crowd is wrong)\n"
         f"  Cover       → % of test rows where strategy fires a signal\n"
+        f"  WinRate     → % of trades where the price moved the right way\n"
+        f"  Profit%     → % of trades that made money AFTER the fee\n"
+        f"  Ret/Trd     → mean realised return per trade (before the fee)\n"
         f"  AUC/Brier   → ML metrics on the strategy's own win criterion\n"
+        f"  Sharpe      → per trade, NOT annualised\n"
         f"  Trades      → trades executed in backtest (strategy-entry ≥ {threshold:.0%})"
     )
 
@@ -507,12 +518,14 @@ def _print_strategy_detail(r: StrategyResult, threshold: float) -> None:
     if bt.total_trades == 0:
         print(f"  No trades triggered — try lowering --entry-threshold")
     else:
-        print(f"  Trades   : {bt.total_trades}")
-        print(f"  Win rate : {bt.win_rate:.2%}")
-        print(f"  Total PnL: ${bt.total_pnl:,.2f}")
-        print(f"  ROI      : {bt.roi:+.2%}")
-        print(f"  Sharpe   : {bt.sharpe_ratio:.2f}")
-        print(f"  Max DD   : ${bt.max_drawdown:,.2f}  ({bt.max_drawdown_pct:.2%})")
+        print(f"  Trades     : {bt.total_trades}")
+        print(f"  Win rate   : {bt.win_rate:.2%}   (price moved the right way)")
+        print(f"  Profitable : {bt.profit_rate:.2%}   (after fee)")
+        print(f"  Mean return: {bt.mean_trade_return:+.4%} per trade")
+        print(f"  Total PnL  : ${bt.total_pnl:,.2f}")
+        print(f"  ROI        : {bt.roi:+.2%}")
+        print(f"  Sharpe     : {bt.sharpe_ratio:.3f}  (per trade)")
+        print(f"  Max DD     : ${bt.max_drawdown:,.2f}  ({bt.max_drawdown_pct:.2%})")
 
     print(f"{'='*w}")
 
@@ -611,7 +624,9 @@ def main() -> None:
         .filter(pl.col("win").is_not_null())
         .collect()
     )
-    split = walk_forward_split(labeled, feature_cols, cfg.split, cfg.label)
+    split = walk_forward_split(
+        labeled, feature_cols, cfg.split, cfg.label, cfg.bucket.bucket_minutes
+    )
     del labeled
     gc.collect()
     print_split_info(split)
@@ -667,7 +682,12 @@ def main() -> None:
                 ))
                 continue
 
-            metrics, bt = _run_eval(y_true, y_pred, cfg)
+            # A strategy that bets AGAINST the dominant side holds the
+            # complementary token, so it realises the opposite return.
+            ret_col = "trade_return" if direction == "follow" else "trade_return_opp"
+            returns = test_df[ret_col].to_numpy().astype(np.float64)
+
+            metrics, bt = _run_eval(y_true, y_pred, returns, cfg)
             results.append(StrategyResult(
                 name=name, description=description,
                 bet_direction=direction,
@@ -729,6 +749,7 @@ def main() -> None:
             if not r.error and r.bt is not None:
                 _log_entry[f"{r.name}_auc"]    = round(r.metrics.roc_auc, 4)
                 _log_entry[f"{r.name}_roi"]    = round(r.bt.roi, 4)
+                _log_entry[f"{r.name}_ret"]    = round(r.bt.mean_trade_return, 6)
                 _log_entry[f"{r.name}_sharpe"] = round(r.bt.sharpe_ratio, 3)
                 _log_entry[f"{r.name}_trades"] = r.bt.total_trades
             else:

@@ -6,6 +6,15 @@ Binary label:  win ∈ {0, 1}
 - NO side:  win=1 if future_price < entry_price - min_move
 
 Regression target: future_return = (future_price - entry_price) / entry_price
+
+Realised trade returns (used by the backtest — NOT features):
+- trade_return      = return of holding the DOMINANT side of the bucket
+                      for `forward_window_buckets` buckets
+- trade_return_opp  = return of holding the OPPOSITE side instead
+
+`win` only says whether the price moved the right way; it says nothing about
+*how far*.  A share bought at 0.50 that moves to 0.501 is a win, but it pays
+0.2 %, not 100 %.  The backtest therefore has to use trade_return, not `win`.
 """
 
 import gc
@@ -82,30 +91,51 @@ def add_labels(
         .alias("win"),
     )
 
-    # Nullify labels for excluded or empty buckets
-    if "exclude_from_training" in df.columns:
-        df = df.with_columns(
-            pl.when(pl.col("exclude_from_training"))
-            .then(pl.lit(None))
-            .otherwise(pl.col("win"))
-            .alias("win"),
-            pl.when(pl.col("exclude_from_training"))
-            .then(pl.lit(None))
-            .otherwise(pl.col("future_return"))
-            .alias("future_return"),
-        )
+    # ── Realised trade returns ───────────────────────────────────────────
+    #
+    # Entry at mean_price of the current bucket, exit at mean_price of the
+    # bucket `forward_window_buckets` ahead.  A YES share costs `p`, a NO
+    # share costs `1 - p`, so the two sides have different denominators:
+    #
+    #   YES: buy at p,      sell at p'      → (p' - p) / p
+    #   NO : buy at (1-p),  sell at (1-p')  → (p - p') / (1 - p)
+    #
+    # trade_return     → betting WITH the dominant bucket side (what `win` scores)
+    # trade_return_opp → betting AGAINST it (the complementary token)
+    _entry = pl.col("mean_price").clip(1e-6, 1.0 - 1e-6)
+    _exit = pl.col("future_price")
+    _ret_yes = (_exit - _entry) / _entry
+    _ret_no = (_entry - _exit) / (1.0 - _entry)
+    _yes_dominant = pl.col("yes_ratio") > 0.5
 
-    # Nullify labels for empty buckets (no real trades → no real entry)
-    if "is_empty_bucket" in df.columns:
+    df = df.with_columns(
+        pl.when(_yes_dominant)
+        .then(_ret_yes)
+        .otherwise(_ret_no)
+        .fill_nan(None)
+        .alias("trade_return"),
+        pl.when(_yes_dominant)
+        .then(_ret_no)
+        .otherwise(_ret_yes)
+        .fill_nan(None)
+        .alias("trade_return_opp"),
+    )
+
+    # Nullify targets for excluded or empty buckets.
+    # Excluded: inside a known data gap.  Empty: no real trades in the bucket,
+    # so mean_price is only a forward-filled carry-over — no real entry price.
+    _targets = ["win", "future_return", "trade_return", "trade_return_opp"]
+    for flag in ("exclude_from_training", "is_empty_bucket"):
+        if flag not in df.columns:
+            continue
         df = df.with_columns(
-            pl.when(pl.col("is_empty_bucket"))
-            .then(pl.lit(None))
-            .otherwise(pl.col("win"))
-            .alias("win"),
-            pl.when(pl.col("is_empty_bucket"))
-            .then(pl.lit(None))
-            .otherwise(pl.col("future_return"))
-            .alias("future_return"),
+            [
+                pl.when(pl.col(flag))
+                .then(pl.lit(None))
+                .otherwise(pl.col(col))
+                .alias(col)
+                for col in _targets
+            ]
         )
 
     # Cast win to Int8 (nullable)
@@ -139,6 +169,9 @@ def label_stats(df: pl.DataFrame) -> dict:
         ),
         "std_future_return": (
             labeled["future_return"].std() if "future_return" in labeled.columns else None
+        ),
+        "mean_trade_return": (
+            labeled["trade_return"].mean() if "trade_return" in labeled.columns else None
         ),
     }
 
@@ -210,6 +243,9 @@ def label_stats_lazy(labeled_path: str) -> dict:
             pl.col("future_return").mean().alias("mean_future_return"),
             pl.col("future_return").std().alias("std_future_return"),
         ]
+    has_trade_return = "trade_return" in schema_names
+    if has_trade_return:
+        agg_exprs.append(pl.col("trade_return").mean().alias("mean_trade_return"))
 
     row = lf.select(agg_exprs).collect()
 
@@ -229,5 +265,7 @@ def label_stats_lazy(labeled_path: str) -> dict:
     if has_future_return:
         result["mean_future_return"] = row["mean_future_return"][0]
         result["std_future_return"]  = row["std_future_return"][0]
+    if has_trade_return:
+        result["mean_trade_return"] = row["mean_trade_return"][0]
 
     return result

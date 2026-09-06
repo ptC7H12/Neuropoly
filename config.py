@@ -107,11 +107,13 @@ class SplitConfig:
     val_ratio: float = 0.15
     test_ratio: float = 0.15
 
-    # Gap between splits (in buckets) to avoid leakage
-    split_gap_buckets: int = 12  # 12 × 5min = 1 hour gap
-
-    # Purge window: remove labels whose forward window overlaps with next split
-    purge_forward_buckets: int = 6  # Must match LabelConfig.forward_window_buckets
+    # Safety gap between two splits, in WALL-CLOCK MINUTES.
+    # This is added on top of the label's own forward window, which is purged
+    # automatically (see pipeline/splitter.purge_minutes).  Measuring the gap
+    # in minutes rather than in rows is essential: rows are interleaved across
+    # thousands of markets, so a row-based gap collapses to seconds of wall
+    # time and lets labels leak across the boundary.
+    split_gap_minutes: int = 60
 
 
 @dataclass
@@ -176,7 +178,13 @@ class BacktestConfig:
     # Probability threshold to enter a trade
     entry_threshold: float = 0.6
 
-    # Transaction fee (Polymarket fee)
+    # Round-trip trading cost per trade, as a fraction of the notional stake.
+    # Covers exchange fee + bid/ask spread + slippage.
+    #
+    # IMPORTANT: at the default 30-minute label horizon the realised price
+    # move is on the order of 1 %, so this number dominates the backtest
+    # result.  Set it to what you actually pay — 0.02 is a conservative
+    # placeholder, not a measured Polymarket fee.
     fee_rate: float = 0.02
 
     # Max position size (USD)
