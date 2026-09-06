@@ -180,11 +180,16 @@ def add_labels_streaming(
     features_path: str,
     cfg: LabelConfig,
     output_path: str = "labeled.parquet",
+    batch_markets: int = 100,
 ) -> str:
     """
-    Add win/future_return labels one market at a time from a features Parquet
-    file.  Peak RAM = one market's rows (same row-group-per-market invariant
-    guaranteed by build_features_streaming).
+    Add win / future_return / trade_return labels from a features Parquet
+    file, `batch_markets` markets at a time.
+
+    Every label expression is market-aware (shift(-N).over("market_id") or
+    row-wise), so a batch yields exactly the same values as one market at a
+    time while amortising Polars' per-call overhead.  Peak RAM is
+    `batch_markets` markets' rows; pass 1 to process strictly one at a time.
 
     Returns the output file path.
     """
@@ -194,24 +199,29 @@ def add_labels_streaming(
     pf = pq.ParquetFile(features_path)
     n_rg = pf.metadata.num_row_groups
     writer = None
+    batch_markets = max(1, batch_markets)
 
-    for rg_idx in range(n_rg):
-        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+    for batch_start in range(0, n_rg, batch_markets):
+        group_ids = list(range(batch_start, min(batch_start + batch_markets, n_rg)))
+        batch_df = pl.from_arrow(pf.read_row_groups(group_ids))
 
-        labeled_df = add_labels(market_df, cfg)
-        del market_df
+        labeled_df = add_labels(batch_df, cfg)
+        del batch_df
 
-        arrow_tbl = labeled_df.to_arrow()
-        if writer is None:
-            writer = pq.ParquetWriter(
-                output_path,
-                schema=arrow_tbl.schema,
-                compression="SNAPPY",
-                version="2.6",
-            )
-        writer.write_table(arrow_tbl)
+        # Preserve one row group per market
+        for part in labeled_df.partition_by("market_id", maintain_order=True):
+            arrow_tbl = part.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    output_path,
+                    schema=arrow_tbl.schema,
+                    compression="SNAPPY",
+                    version="2.6",
+                )
+            writer.write_table(arrow_tbl)
+            del arrow_tbl, part
 
-        del labeled_df, arrow_tbl
+        del labeled_df
         gc.collect()
 
     if writer:

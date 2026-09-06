@@ -33,7 +33,13 @@ class TrainingMonitor:
         self.cfg = cfg
         self.metrics_history: list[dict] = []
         self.start_time: float = 0.0
-        self.best_score: float = float("inf")
+        # One "best" per metric.  The previous version kept a single scalar
+        # and fed both binary_logloss (lower is better) and auc (higher is
+        # better) into it with opposite comparisons, so whichever metric came
+        # last in the eval list silently lost.
+        self.best_scores: dict[str, float] = {}
+        self.best_iterations: dict[str, int] = {}
+        self.primary_metric: str | None = None
         self.best_iteration: int = 0
         self.total_iterations: int = 0
         self.feature_names: list[str] = []
@@ -59,6 +65,13 @@ class TrainingMonitor:
             except ImportError:
                 pass
 
+    @property
+    def best_score(self) -> float:
+        """Best value of the primary validation metric (inf if none yet)."""
+        if self.primary_metric is None:
+            return float("inf")
+        return self.best_scores.get(self.primary_metric, float("inf"))
+
     def set_feature_names(self, names: list[str]) -> None:
         self.feature_names = names
 
@@ -78,15 +91,20 @@ class TrainingMonitor:
                 key = f"{data_name}_{eval_name}"
                 results[key] = value
 
-                # Track best score (using validation metric)
+                # Track the best value of each validation metric separately
                 if data_name == "valid_0":
-                    if is_higher_better:
-                        if value > self.best_score or self.best_score == float("inf"):
-                            self.best_score = value
-                            self.best_iteration = iteration
-                    else:
-                        if value < self.best_score:
-                            self.best_score = value
+                    if self.primary_metric is None:
+                        # First validation metric reported drives the summary
+                        self.primary_metric = eval_name
+                    prev = self.best_scores.get(eval_name)
+                    better = (
+                        prev is None
+                        or (value > prev if is_higher_better else value < prev)
+                    )
+                    if better:
+                        self.best_scores[eval_name] = value
+                        self.best_iterations[eval_name] = iteration
+                        if eval_name == self.primary_metric:
                             self.best_iteration = iteration
 
             results["iteration"] = iteration
@@ -280,8 +298,11 @@ class TrainingMonitor:
 
         summary = {
             "total_iterations": len(self.metrics_history),
+            "primary_metric": self.primary_metric,
             "best_score": self.best_score,
             "best_iteration": self.best_iteration,
+            "best_scores": dict(self.best_scores),
+            "best_iterations": dict(self.best_iterations),
             "elapsed_seconds": elapsed,
             "log_file": self.cfg.log_file,
         }
@@ -291,7 +312,7 @@ class TrainingMonitor:
             self._console.print(
                 Panel(
                     f"Training complete!\n"
-                    f"  Best score: {self.best_score:.6f} at iteration {self.best_iteration}\n"
+                    f"  Best: {self._best_summary()}\n"
                     f"  Total time: {elapsed:.1f}s\n"
                     f"  Log file: {self.cfg.log_file}",
                     title="Training Summary",
@@ -301,12 +322,21 @@ class TrainingMonitor:
         else:
             print(f"\n{'='*50}")
             print(f"Training complete!")
-            print(f"  Best score: {self.best_score:.6f} @ iteration {self.best_iteration}")
+            print(f"  Best: {self._best_summary()}")
             print(f"  Total time: {elapsed:.1f}s")
             print(f"  Log file: {self.cfg.log_file}")
             print(f"{'='*50}")
 
         return summary
+
+    def _best_summary(self) -> str:
+        """All tracked validation metrics with the iteration each peaked at."""
+        if not self.best_scores:
+            return "no validation metrics recorded"
+        return "  ".join(
+            f"{name}={value:.6f} @{self.best_iterations[name]}"
+            for name, value in self.best_scores.items()
+        )
 
     def get_history_df(self):
         """Return metrics history as a polars DataFrame."""

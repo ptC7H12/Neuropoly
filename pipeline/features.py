@@ -60,17 +60,28 @@ def build_features_streaming(
     markets: pl.DataFrame,
     cfg: FeatureConfig,
     output_path: str = "features.parquet",
+    batch_markets: int = 100,
 ) -> str:
     """
-    Build features one market at a time from a gap-filled Parquet file.
+    Build features from a gap-filled Parquet file, `batch_markets` markets at
+    a time.
 
     *filled_path* must contain exactly one row group per market — this is
     guaranteed by the gap_handler streaming pipeline (fill_buckets →
     detect_consecutive_gaps → apply_gap_exclusions all write with PyArrow,
-    one market per write_table call).
+    one market per write_table call).  The same invariant is preserved on
+    output, because add_labels_streaming relies on it.
 
-    Writes the feature matrix to *output_path* via a streaming PyArrow
-    writer — peak RAM = one market's rows.  Returns output_path.
+    Why batch: every feature here is already market-aware via .over(
+    "market_id"), so a batch produces exactly the same numbers as one market
+    at a time — but a single-market call spends ~17 ms of Polars per-call
+    overhead on a frame of a few dozen rows.  At 3 200 markets that was 76 s
+    of the 130 s preprocessing chain.  Batching amortises it.
+
+    RAM cost: peak is `batch_markets` markets instead of one.  Lower it if a
+    chunk is memory-tight; batch_markets=1 restores the old behaviour.
+
+    Returns output_path.
     """
 
     output_path = str(Path(output_path))
@@ -81,28 +92,34 @@ def build_features_streaming(
     pf = pq.ParquetFile(filled_path)
     n_rg = pf.metadata.num_row_groups
     writer = None
+    batch_markets = max(1, batch_markets)
 
-    for rg_idx in range(n_rg):
-        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+    for batch_start in range(0, n_rg, batch_markets):
+        group_ids = list(range(batch_start, min(batch_start + batch_markets, n_rg)))
+        batch_df = pl.from_arrow(pf.read_row_groups(group_ids))
 
-        featured = build_features(market_df, markets, cfg)
-        del market_df
+        featured = build_features(batch_df, markets, cfg)
+        del batch_df
 
-        arrow_tbl = featured.to_arrow()
-        if writer is None:
-            writer = pq.ParquetWriter(
-                output_path,
-                schema=arrow_tbl.schema,
-                compression="SNAPPY",
-                version="2.6",
-            )
-        writer.write_table(arrow_tbl)
+        # One row group per market on the way out — add_labels_streaming
+        # reads this file back on that assumption.
+        for part in featured.partition_by("market_id", maintain_order=True):
+            arrow_tbl = part.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    output_path,
+                    schema=arrow_tbl.schema,
+                    compression="SNAPPY",
+                    version="2.6",
+                )
+            writer.write_table(arrow_tbl)
+            del arrow_tbl, part
 
-        del featured, arrow_tbl
+        del featured
         gc.collect()
 
-        if (rg_idx + 1) % 100 == 0 or (rg_idx + 1) == n_rg:
-            print(f"  build_features: {rg_idx + 1}/{n_rg} markets", flush=True)
+        done = min(batch_start + batch_markets, n_rg)
+        print(f"  build_features: {done}/{n_rg} markets", flush=True)
 
     if writer:
         writer.close()
