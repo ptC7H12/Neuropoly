@@ -206,6 +206,24 @@ def _run_full_pipeline():
     assert stats["labeled"] > 0, "Should have labeled rows"
     assert 0.2 < stats["win_rate"] < 0.8, f"Win rate {stats['win_rate']} seems extreme"
 
+    # Both ends of a labelled trade must be a price someone actually traded
+    # at.  The entry side was always checked; the exit side was not, and on
+    # sparse data that was the majority of all labels.
+    _w = cfg.label.forward_window_buckets
+    _check = labeled.with_columns(
+        pl.col("is_empty_bucket").shift(-_w).over("market_id")
+        .fill_null(True).alias("_exit_empty"),
+        pl.col("exclude_from_training").shift(-_w).over("market_id")
+        .fill_null(True).alias("_exit_excluded"),
+    ).filter(pl.col("win").is_not_null())
+    _phantom = _check.filter(
+        pl.col("_exit_empty") | pl.col("_exit_excluded")
+    ).height
+    assert _phantom == 0, (
+        f"{_phantom} labelled rows exit into a bucket that never traded"
+    )
+    print(f"  no label exits into an empty bucket ({_check.height} checked)")
+
     # Split
     print("\n[6] Walk-forward split...")
     split = walk_forward_split(

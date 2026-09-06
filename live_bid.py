@@ -48,9 +48,11 @@ from config import PipelineConfig
 from pipeline.live_features import (
     UNAVAILABLE_LIVE_FEATURES,
     align_to_model,
+    bucket_age,
     build_live_features,
     explain_missing,
     history_window,
+    is_stale,
 )
 from pipeline.polymarket_api import (
     MarketInfo,
@@ -251,6 +253,15 @@ def main() -> None:
           f"(gap-filled, current bucket excluded)")
     print(f"  Scoring bucket: {last_bucket_time}")
 
+    age = bucket_age(last_bucket_time, now, cfg.bucket.bucket_minutes)
+    stale = is_stale(age, cfg.bucket.bucket_minutes)
+    if stale:
+        mins = age.total_seconds() / 60
+        print(f"  !! STALE: that bucket closed {mins:.0f} min ago. The market "
+              f"has not traded since,")
+        print(f"     so this is not a live signal — every training row is a "
+              f"bucket that had just closed.")
+
     longest = max(cfg.features.rolling_windows, default=1)
     if n_buckets < longest:
         print(f"  WARNING: only {n_buckets} buckets — rolling windows up to "
@@ -288,7 +299,9 @@ def main() -> None:
     bid = p_win >= args.threshold
 
     print(f"\n{'='*55}")
-    print(f"  Scored bucket            : {last_bucket_time}")
+    _age_note = (f"  ({age.total_seconds()/60:.0f} min old — STALE)"
+                 if stale else "")
+    print(f"  Scored bucket            : {last_bucket_time}{_age_note}")
     print(f"  Bucket yes_ratio         : {yes_ratio_val:.2f}")
     print(f"  Mean price (P(YES))      : {last_bucket['mean_price'][0]:.4f}")
     print(f"  Dominant side            : {dominant_side} "

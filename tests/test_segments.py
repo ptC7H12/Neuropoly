@@ -135,6 +135,32 @@ def test_load_segment_map_rejects_a_bad_file():
         tmp.unlink(missing_ok=True)
 
 
+def test_segment_of_defaults_unmapped_markets_to_other():
+    """
+    sweep_horizon and benchmark_strategies must agree on what an unmapped
+    market is.  They did not: one defaulted it to "other" (so `--segment
+    other` included it), the other filtered by membership in the map (so it
+    was dropped).  Same flag, different market sets.
+    """
+    from pipeline.segments import segment_of, segment_series
+
+    seg_map = {1: "sports", 2: "politics"}
+    assert segment_of(1, seg_map) == "sports"
+    assert segment_of(99, seg_map) == "other", "unmapped must be `other`"
+    assert segment_of(None, seg_map) == "other"
+    assert segment_of("not-a-number", seg_map) == "other"
+
+    # The vectorised path used by benchmark_strategies must agree row for row
+    ids = [1, 2, 99, None]
+    series = segment_series(ids, seg_map)
+    assert series.to_list() == [segment_of(i, seg_map) for i in ids]
+
+    # And `other` must actually select the unmapped market
+    chosen = [i for i, sg in zip(ids, series.to_list()) if sg == "other"]
+    assert 99 in chosen, "unmapped market missing from `other`"
+    print("  unmapped markets default to `other` in both filter paths")
+
+
 def test_favourite_and_longshot_are_complements():
     """
     The two price-based strategies must pick opposite sides of the same
@@ -192,6 +218,7 @@ if __name__ == "__main__":
     test_segment_from_tags_matches_classify_order()
     test_classify_frame_and_round_trip()
     test_load_segment_map_rejects_a_bad_file()
+    test_segment_of_defaults_unmapped_markets_to_other()
     test_favourite_and_longshot_are_complements()
     test_y_true_flips_with_the_chosen_side()
     print("  ALL PASSED")

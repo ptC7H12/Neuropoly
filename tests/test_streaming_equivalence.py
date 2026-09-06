@@ -183,6 +183,86 @@ def test_live_bucket_truncation_matches_polars():
     print("  live bucket truncation matches aggregation for 1-240 min")
 
 
+def test_row_group_invariant_is_enforced():
+    """
+    Every lag, rolling window and label is computed per market from one row
+    group.  PyArrow does not guarantee that shape — write_table splits a
+    table past ~1.05M rows — so a file that violates it must fail loudly
+    rather than produce wrong values at the seam.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from pipeline.rowgroups import iter_market_row_groups, write_market_table
+
+    _TMP.mkdir(exist_ok=True)
+    try:
+        # Two markets deliberately written into ONE row group
+        bad = _TMP / "bad.parquet"
+        tbl = pa.table({"market_id": [1, 1, 2, 2], "x": [1.0, 2.0, 3.0, 4.0]})
+        pq.write_table(tbl, bad, row_group_size=4)
+        pf = pq.ParquetFile(bad)
+        assert pf.metadata.num_row_groups == 1
+        try:
+            list(iter_market_row_groups(pf))
+            raise AssertionError("a mixed row group was accepted")
+        except ValueError as exc:
+            assert "2 markets" in str(exc), str(exc)
+
+        # Written properly, one market per call, it passes
+        good = _TMP / "good.parquet"
+        writer = pq.ParquetWriter(good, tbl.schema)
+        for mid in (1, 2):
+            part = pa.table({"market_id": [mid, mid], "x": [1.0, 2.0]})
+            write_market_table(writer, part)
+        writer.close()
+        groups = list(iter_market_row_groups(pq.ParquetFile(good)))
+        assert len(groups) == 2, f"expected 2 row groups, got {len(groups)}"
+        print("  row-group invariant: mixed group rejected, clean file accepted")
+    finally:
+        import shutil
+        shutil.rmtree(_TMP, ignore_errors=True)
+
+
+def test_write_market_table_keeps_one_group_for_a_big_market():
+    """
+    The default row_group_size (~1.05M) is what silently breaks the
+    invariant; pinning it to the table length is the fix.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from pipeline.rowgroups import write_market_table
+
+    _TMP.mkdir(exist_ok=True)
+    try:
+        n = 1_200_000                       # past PyArrow's default split
+        tbl = pa.table({"market_id": [7] * n, "x": list(range(n))})
+
+        default_path = _TMP / "default.parquet"
+        w = pq.ParquetWriter(default_path, tbl.schema)
+        w.write_table(tbl)                  # the old call
+        w.close()
+        n_default = pq.ParquetFile(default_path).metadata.num_row_groups
+
+        pinned_path = _TMP / "pinned.parquet"
+        w = pq.ParquetWriter(pinned_path, tbl.schema)
+        write_market_table(w, tbl)          # the new call
+        w.close()
+        n_pinned = pq.ParquetFile(pinned_path).metadata.num_row_groups
+
+        assert n_default > 1, (
+            f"expected PyArrow to split {n:,} rows, got {n_default} group(s) — "
+            f"if this ever becomes 1 the invariant is safe by default"
+        )
+        assert n_pinned == 1, f"pinned write produced {n_pinned} row groups"
+        print(f"  {n:,} rows: default writer -> {n_default} groups, "
+              f"write_market_table -> {n_pinned}")
+    finally:
+        import shutil
+        shutil.rmtree(_TMP, ignore_errors=True)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  streaming / cross-path consistency tests")
@@ -190,4 +270,6 @@ if __name__ == "__main__":
     test_batched_streaming_matches_single_market()
     test_features_are_chunk_invariant()
     test_live_bucket_truncation_matches_polars()
+    test_row_group_invariant_is_enforced()
+    test_write_market_table_keeps_one_group_for_a_big_market()
     print("  ALL PASSED")

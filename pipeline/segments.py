@@ -176,6 +176,32 @@ def load_segment_map(path: str) -> dict[int, str]:
     )
 
 
+def segment_of(market_id, segment_map: dict[int, str]) -> str:
+    """
+    Segment of one market, with the documented default.
+
+    A market missing from the map counts as "other" — not as "unknown" and
+    not as dropped.  Both filter paths must agree on this, or `--segment
+    other` selects different market sets in sweep_horizon.py and
+    benchmark_strategies.py.
+    """
+    if market_id is None:
+        return "other"
+    try:
+        return segment_map.get(int(market_id), "other")
+    except (TypeError, ValueError):
+        return "other"
+
+
+def segment_series(market_ids, segment_map: dict[int, str]) -> pl.Series:
+    """Vectorised `segment_of` for a whole column."""
+    return pl.Series(
+        "segment",
+        [segment_of(m, segment_map) for m in market_ids],
+        dtype=pl.Utf8,
+    )
+
+
 # Gamma tag labels that identify a segment, for validation and enrichment.
 # Lower-cased on both sides before comparing.
 _TAG_TO_SEGMENT = {

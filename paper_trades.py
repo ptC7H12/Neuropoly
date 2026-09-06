@@ -42,9 +42,11 @@ from config import PipelineConfig
 from live_bid import fetch_trades_from_db
 from pipeline.live_features import (
     align_to_model,
+    bucket_age,
     build_live_features,
     explain_missing,
     history_window,
+    is_stale,
 )
 from pipeline.polymarket_api import (
     MarketInfo,
@@ -341,6 +343,18 @@ def trading_loop(args, cfg: PipelineConfig, booster: lgb.Booster,
                 print("    Kein abgeschlossener Bucket — ueberspringe")
                 continue
             print(f"    Buckets: {featured.height} x {cfg.bucket.bucket_minutes} min")
+
+            # A decision taken on a bucket that closed hours ago is not a
+            # decision this simulator should score itself on — it would make
+            # the paper-trading statistics look like live performance when
+            # they are not.  Skip instead of logging.
+            age = bucket_age(featured["bucket_time"][-1], now,
+                             cfg.bucket.bucket_minutes)
+            if is_stale(age, cfg.bucket.bucket_minutes):
+                print(f"    Uebersprungen: letzter Bucket ist "
+                      f"{age.total_seconds()/60:.0f} min alt (keine "
+                      f"aktuelle Grundlage)")
+                continue
 
             X, missing = align_to_model(featured, model_features)
             _, unexpected = explain_missing(missing)

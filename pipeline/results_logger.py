@@ -36,7 +36,7 @@ from pathlib import Path
 # Strategy names in display order (must match benchmark_strategies.py STRATEGIES list)
 _BENCH_STRATS = [
     "baseline", "random", "momentum", "reversion",
-    "volume", "closing", "contrarian",
+    "volume", "closing", "contrarian", "favourite", "longshot",
 ]
 
 _W = 78  # table width
@@ -75,6 +75,16 @@ def _load_entries(log_path: str) -> list[dict]:
 # Display
 # ---------------------------------------------------------------------------
 
+def _fmt(value, spec: str, width: int) -> str:
+    """Format a metric, or a right-aligned 'n/a' when the log line lacks it."""
+    if value is None:
+        return f"{'n/a':>{width}}"
+    try:
+        return spec.format(value)
+    except (ValueError, TypeError):
+        return f"{'n/a':>{width}}"
+
+
 def print_log_history(log_path: str, max_rows: int = 10) -> None:
     """
     Print a compact comparison table of past runs from *log_path*.
@@ -100,12 +110,15 @@ def print_log_history(log_path: str, max_rows: int = 10) -> None:
             f" {'Model':<16}"
             f" {'Thr':>5}"
             f" {'TestAUC':>8}"
+            f" {'Profit%':>8}"
+            f" {'Ret/Trd':>9}"
             f" {'TestROI':>9}"
             f" {'Sharpe':>7}"
             f" {'Trades':>7}"
         )
         print(
-            f"  {'─'*22} {'─'*16} {'─'*5} {'─'*8} {'─'*9} {'─'*7} {'─'*7}"
+            f"  {'─'*22} {'─'*16} {'─'*5} {'─'*8} {'─'*8} {'─'*9} "
+            f"{'─'*9} {'─'*7} {'─'*7}"
         )
         for e in tail:
             auc = e.get("test_auc", float("nan"))
@@ -124,11 +137,16 @@ def print_log_history(log_path: str, max_rows: int = 10) -> None:
                 auc_str = f"{auc:>8.4f}"
             except (ValueError, TypeError):
                 auc_str = f"{'N/A':>8}"
+            # Older log lines predate these fields — they must stay readable
+            prof_str = _fmt(e.get("test_profit_rate"), "{:>8.1%}", 8)
+            ret_str = _fmt(e.get("test_mean_ret"), "{:>+9.3%}", 9)
             print(
                 f"  {e.get('ts', '?'):<22}"
                 f" {Path(e.get('model', '')).name:<16}"
                 f" {e.get('threshold', 0):>5.0%}"
                 f" {auc_str}"
+                f" {prof_str}"
+                f" {ret_str}"
                 f" {roi_str}"
                 f" {shp_str}"
                 f" {trd:>7}"
@@ -148,11 +166,10 @@ def print_log_history(log_path: str, max_rows: int = 10) -> None:
         for e in tail:
             row = f"  {e.get('ts', '?'):<22} {e.get('threshold', 0):>5.0%}"
             for s in _BENCH_STRATS:
-                v = e.get(f"{s}_roi")
-                try:
-                    row += f" {v:>+9.1%}" if v is not None else f" {'N/A':>9}"
-                except (ValueError, TypeError):
-                    row += f" {'ERR':>9}"
+                # One column per strategy — adding mean return here as well
+                # pushed the table past 180 characters and made it unreadable.
+                # The per-run detail blocks carry Ret/Trd and Cost.
+                row += " " + _fmt(e.get(f"{s}_roi"), "{:>+9.1%}", 9)
             print(row)
 
     if model_runs or bench_runs:

@@ -168,6 +168,8 @@ def _process_chunk(
     # ── Single streaming pass: features → labels → extract per market ──
     import pyarrow.parquet as pq
 
+    from pipeline.rowgroups import iter_market_row_groups
+
     pf = pq.ParquetFile(filled_path)
     n_rg = pf.metadata.num_row_groups
 
@@ -180,9 +182,7 @@ def _process_chunk(
     total_labeled = 0
     total_wins = 0
 
-    for rg_idx in range(n_rg):
-        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
-
+    for rg_idx, market_df in iter_market_row_groups(pf):
         # Features (single market — fast, small)
         featured = build_features(market_df, markets_df, cfg.features)
         del market_df

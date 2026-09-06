@@ -68,7 +68,7 @@ from pipeline.features import (
     report_degenerate_features,
 )
 from pipeline.labeling import add_labels_streaming, label_stats_lazy
-from pipeline.segments import SEGMENTS, load_segment_map
+from pipeline.segments import SEGMENTS, load_segment_map, segment_series
 from pipeline.splitter import walk_forward_split, print_split_info
 from pipeline.evaluation import evaluate, backtest, EvalMetrics, BacktestResult
 from pipeline.results_logger import append_to_log, print_log_history
@@ -737,12 +737,16 @@ def main() -> None:
                   f"Known: {', '.join(SEGMENTS)}")
             sys.exit(1)
         seg_map = load_segment_map(args.segments)
-        keep = [m for m, sg in seg_map.items() if sg == args.segment]
         before = test_df.height
-        test_df = test_df.filter(pl.col("market_id").is_in(keep))
+        # segment_of() defaults unmapped markets to "other", exactly as
+        # sweep_horizon does — filtering by membership in the map instead
+        # would silently drop them from `--segment other`.
+        seg_col = segment_series(test_df["market_id"].to_list(), seg_map)
+        test_df = test_df.filter(seg_col == args.segment)
+        n_markets_kept = test_df["market_id"].n_unique()
         print(f"\n  Segment filter `{args.segment}`: "
               f"{before:,} → {test_df.height:,} test rows "
-              f"({len(keep):,} markets in that segment)")
+              f"({n_markets_kept:,} markets in that segment)")
         if test_df.height == 0:
             print("  No test rows left in that segment — nothing to benchmark.")
             sys.exit(1)

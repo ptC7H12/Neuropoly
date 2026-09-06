@@ -23,6 +23,11 @@ from pathlib import Path
 import polars as pl
 import pyarrow.parquet as pq
 
+from pipeline.rowgroups import (
+    iter_market_row_groups,
+    write_market_table,
+)
+
 from config import LabelConfig
 
 
@@ -36,8 +41,10 @@ def add_labels(
     Uses mean_price of the current bucket as entry price.
     Uses mean_price N buckets forward as future price.
 
-    Buckets marked `exclude_from_training` or `is_empty_bucket`
-    will NOT receive labels (set to null).
+    Buckets marked `exclude_from_training` or `is_empty_bucket` will NOT
+    receive labels (set to null) — and neither will buckets whose EXIT
+    bucket, `forward_window_buckets` ahead, carries either flag.  Both ends
+    of the trade have to be a price someone actually traded at.
     """
 
     # Compute future price: mean_price shifted backward by forward_window
@@ -132,9 +139,17 @@ def add_labels(
         .alias("entry_token_price_opp"),
     )
 
-    # Nullify targets for excluded or empty buckets.
-    # Excluded: inside a known data gap.  Empty: no real trades in the bucket,
-    # so mean_price is only a forward-filled carry-over — no real entry price.
+    # Nullify targets for buckets where either END of the trade is fictional.
+    #
+    # Entry side: an empty bucket has no real trades, so mean_price is only a
+    # forward-filled carry-over — there is no price you could have entered at.
+    # An excluded bucket sits inside a known data gap.
+    #
+    # EXIT side, checked the same way `forward_window_buckets` ahead: the exit
+    # price comes from that bucket, so if it never traded, the position is
+    # closed at a price nobody quoted.  Forward-fill makes such an exit look
+    # like "no movement", which drags the measured return toward zero — on
+    # sparse data that silently dominates the label set.
     _targets = [
         "win", "future_return", "trade_return", "trade_return_opp",
         "entry_token_price", "entry_token_price_opp",
@@ -142,9 +157,18 @@ def add_labels(
     for flag in ("exclude_from_training", "is_empty_bucket"):
         if flag not in df.columns:
             continue
+        entry_bad = pl.col(flag)
+        # shift(-N) is null past the end of a market; future_price is null
+        # there too, so those rows are already unlabelled either way.
+        exit_bad = (
+            pl.col(flag)
+            .shift(-cfg.forward_window_buckets)
+            .over("market_id")
+            .fill_null(True)
+        )
         df = df.with_columns(
             [
-                pl.when(pl.col(flag))
+                pl.when(entry_bad | exit_bad)
                 .then(pl.lit(None))
                 .otherwise(pl.col(col))
                 .alias(col)
@@ -232,7 +256,7 @@ def add_labels_streaming(
                     compression="SNAPPY",
                     version="2.6",
                 )
-            writer.write_table(arrow_tbl)
+            write_market_table(writer, arrow_tbl)
             del arrow_tbl, part
 
         del labeled_df

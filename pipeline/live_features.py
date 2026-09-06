@@ -120,6 +120,25 @@ def _truncate(dt: datetime, bucket_minutes: int) -> datetime:
     return pl.Series([dt]).dt.truncate(f"{bucket_minutes}m")[0]
 
 
+def bucket_age(last_bucket_time, now: datetime, bucket_minutes: int) -> timedelta:
+    """
+    How old the scored bucket is, measured from the END of that bucket.
+
+    The live path scores the last bucket that actually EXISTS, which on a
+    quiet market can be hours old — in a real test run the scored bucket was
+    11:00 while the clock said 13:15.  Every training row, by contrast, is a
+    bucket that had just closed.  Scoring a stale bucket is not wrong, but
+    calling it a live signal without saying so is.
+    """
+    bucket_end = last_bucket_time + timedelta(minutes=bucket_minutes)
+    return now - bucket_end
+
+
+def is_stale(age: timedelta, bucket_minutes: int, max_buckets: int = 3) -> bool:
+    """True when the scored bucket is older than `max_buckets` bucket widths."""
+    return age > timedelta(minutes=max_buckets * bucket_minutes)
+
+
 def history_window(cfg: PipelineConfig, history_buckets: int) -> timedelta:
     """How far back the live path has to look to fill every rolling window."""
     needed = max(

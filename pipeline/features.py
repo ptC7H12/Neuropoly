@@ -8,6 +8,11 @@ from pathlib import Path
 
 import polars as pl
 import pyarrow.parquet as pq
+
+from pipeline.rowgroups import (
+    iter_market_row_groups,
+    write_market_table,
+)
 from datetime import datetime
 
 from config import FeatureConfig
@@ -112,7 +117,7 @@ def build_features_streaming(
                     compression="SNAPPY",
                     version="2.6",
                 )
-            writer.write_table(arrow_tbl)
+            write_market_table(writer, arrow_tbl)
             del arrow_tbl, part
 
         del featured

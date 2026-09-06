@@ -753,6 +753,7 @@ Neuropoly/
 │   ├── evaluation.py       Metriken + Backtest
 │   ├── polymarket_api.py   Gamma- + data-api-Zugriff (gemeinsam genutzt)
 │   ├── segments.py         Markt-Segmentierung aus dem Slug
+│   ├── rowgroups.py        Invariante "eine Row Group = ein Markt"
 │   ├── live_features.py    Live-Features ueber die Trainings-Codepfade
 │   └── results_logger.py   Historisches Ergebnis-Log
 └── tests/
@@ -760,6 +761,7 @@ Neuropoly/
     ├── test_data_loader.py            Preis-Normalisierung
     ├── test_segments.py               Segmentierung + favourite/longshot
     ├── test_backtest.py               Backtest-Invarianten
+    ├── test_evaluation.py             Metrik-Randfaelle
     └── test_streaming_equivalence.py  Batching == Einzelmarkt
 ```
 
@@ -890,6 +892,13 @@ python paper_trades.py --report --paper-db paper_trades.db
 | `--db` | — | SQLite-DB aus collect_trades.py (optional) |
 | `--verbose` | — | Alle Feature-Werte ausgeben |
 
+**Staleness-Warnung:** gescort wird der letzte Bucket, der tatsaechlich
+*existiert*. Auf einem ruhigen Markt kann der Stunden alt sein — in einem
+echten Testlauf lag er bei 11:00, waehrend die Uhr 13:15 zeigte. Ist er
+aelter als drei Bucket-Breiten, weist `live_bid.py` deutlich darauf hin;
+`paper_trades.py` ueberspringt solche Entscheidungen ganz, damit sie die
+Paper-Trading-Statistik nicht wie Live-Performance aussehen lassen.
+
 ---
 
 ## RAM-Verbrauch
@@ -972,6 +981,18 @@ Jetzt (Bucket t)          +30 Min (Bucket t+6)
 
 - `yes_ratio > 0.5` im Bucket → Mehrheit kauft YES → `win=1` wenn Preis steigt
 - `yes_ratio <= 0.5` im Bucket → Mehrheit kauft NO → `win=1` wenn Preis faellt
+
+**Beide Enden muessen echt sein.** Ein Label entsteht nur, wenn sowohl der
+Einstiegs- als auch der Ausstiegs-Bucket tatsaechlich gehandelt wurde. Der
+Ausstiegspreis stammt aus dem Bucket `forward_window_buckets` spaeter — hat
+der keine Trades, ist sein Preis nur eine Fortschreibung des letzten
+bekannten Werts. Solche Labels sehen nach „keine Bewegung" aus und ziehen die
+gemessene Rendite gegen null.
+
+Auf duennen Daten ist das die Mehrheit: in einem Testlauf beruhten **67,9 %**
+aller Labels auf einem solchen Phantom-Ausstieg (16.830 → 5.402 Labels nach
+dem Fix, mittlere |Rendite| 1,21 % → 1,27 %). Wenn dir die Label-Zahl niedrig
+vorkommt: das ist der Grund, und es ist die richtige Richtung.
 
 `win` sagt nur, **ob** sich der Preis um mindestens 0.001 in die richtige
 Richtung bewegt hat — nicht, um wie viel. Fuer den Backtest berechnet

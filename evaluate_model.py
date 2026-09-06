@@ -92,7 +92,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--low-memory",      action="store_true",
                    help="Smaller feature set, less RAM")
     p.add_argument("--keep-intermediates", action="store_true",
-                   help="Keep bucketed/filled/features/labeled Parquet files after evaluation")
+                   help="Keep the bucketed/filled Parquet files after evaluation. "
+                        "Features and labels are NOT written here — the streaming "
+                        "path keeps them in RAM only. Use benchmark_strategies.py "
+                        "--keep-intermediates if you need labeled.parquet.")
     p.add_argument("--log-file", default="results_log.jsonl", metavar="PATH",
                    help="JSONL file to append results to for historical tracking "
                         "(default: results_log.jsonl). Pass '' to disable.")
@@ -151,7 +154,10 @@ def print_split_eval(
     print(f"\n{'='*w}")
     print(f"  {name.upper()}")
     print(f"{'='*w}")
-    print(f"  ROC AUC  : {metrics.roc_auc:.4f}")
+    if metrics.roc_auc_defined:
+        print(f"  ROC AUC  : {metrics.roc_auc:.4f}")
+    else:
+        print(f"  ROC AUC  : n/a  (only one class in this split)")
     print(f"  Log Loss : {metrics.log_loss:.4f}")
     print(f"  Brier    : {metrics.brier_score:.4f}")
     print(f"  Accuracy : {metrics.accuracy:.4f}  (threshold {threshold:.0%})")
@@ -240,6 +246,8 @@ def main() -> None:
     print("\n[4/6] Features + labels (streaming, one market at a time)...")
     import pyarrow.parquet as pq
 
+    from pipeline.rowgroups import iter_market_row_groups
+
     pf = pq.ParquetFile(filled_path)
     n_rg = pf.metadata.num_row_groups
 
@@ -253,9 +261,7 @@ def main() -> None:
     total_labeled = 0
     total_wins = 0
 
-    for rg_idx in range(n_rg):
-        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
-
+    for rg_idx, market_df in iter_market_row_groups(pf):
         featured = build_features(market_df, markets_df, cfg.features)
         del market_df
 

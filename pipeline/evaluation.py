@@ -26,6 +26,9 @@ class EvalMetrics:
 
     accuracy: float = 0.0
     roc_auc: float = 0.0
+    # False when y_true held a single class — ROC AUC is undefined there and
+    # roc_auc is NaN.  Every other metric stays meaningful.
+    roc_auc_defined: bool = True
     log_loss: float = 0.0
     brier_score: float = 0.0
     precision: float = 0.0
@@ -110,10 +113,20 @@ def evaluate(
 
     y_pred = (y_pred_proba >= threshold).astype(int)
 
+    # A split can legitimately hold a single class (short window, heavy
+    # exclusion).  roc_auc_score raises there, which used to kill the caller
+    # AFTER the whole preprocessing pipeline had run.  Report NaN and carry
+    # on — Brier, accuracy and the calibration curve are still valid.
+    classes = np.unique(y_true)
+    auc_defined = len(classes) > 1
+    auc = roc_auc_score(y_true, y_pred_proba) if auc_defined else float("nan")
+
     metrics = EvalMetrics(
         accuracy=accuracy_score(y_true, y_pred),
-        roc_auc=roc_auc_score(y_true, y_pred_proba),
-        log_loss=log_loss(y_true, y_pred_proba),
+        roc_auc=auc,
+        roc_auc_defined=auc_defined,
+        # labels=[0, 1] so a single-class split does not raise here either
+        log_loss=log_loss(y_true, y_pred_proba, labels=[0, 1]),
         brier_score=brier_score_loss(y_true, y_pred_proba),
         precision=precision_score(y_true, y_pred, zero_division=0),
         recall=recall_score(y_true, y_pred, zero_division=0),
@@ -380,7 +393,10 @@ def print_evaluation(metrics: EvalMetrics, bt: BacktestResult) -> None:
     print("=" * 60)
 
     print("\n  Classification Metrics:")
-    print(f"    ROC AUC:      {metrics.roc_auc:.4f}")
+    if metrics.roc_auc_defined:
+        print(f"    ROC AUC:      {metrics.roc_auc:.4f}")
+    else:
+        print(f"    ROC AUC:      n/a  (only one class in this split)")
     print(f"    Log Loss:     {metrics.log_loss:.4f}")
     print(f"    Brier Score:  {metrics.brier_score:.4f}")
     print(f"    Accuracy:     {metrics.accuracy:.4f}")

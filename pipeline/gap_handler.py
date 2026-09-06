@@ -20,6 +20,11 @@ from datetime import timedelta
 import polars as pl
 import pyarrow.parquet as pq
 
+from pipeline.rowgroups import (
+    iter_market_row_groups,
+    write_market_table,
+)
+
 from config import GapConfig, BucketConfig
 
 
@@ -199,7 +204,7 @@ def fill_buckets(
                 compression="SNAPPY",
                 version="2.6",
             )
-        writer.write_table(arrow_tbl)
+        write_market_table(writer, arrow_tbl)
 
         # Release this partition's memory as we go
         partitions[idx - 1] = None
@@ -253,9 +258,9 @@ def detect_consecutive_gaps(
 
     writer = None
 
-    for rg_idx in range(n_rg):
-        # Read one row group = one market (guaranteed by fill_buckets)
-        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+    # One row group = one market; the generator enforces it rather than
+    # assuming it (see pipeline/rowgroups).
+    for rg_idx, market_df in iter_market_row_groups(pf):
 
         # Run-length encoding of is_empty_bucket
         empty = market_df["is_empty_bucket"].to_list()
@@ -287,7 +292,7 @@ def detect_consecutive_gaps(
                 compression="SNAPPY",
                 version="2.6",
             )
-        writer.write_table(arrow_tbl)
+        write_market_table(writer, arrow_tbl)
 
         del market_df, arrow_tbl, empty, forward_run, backward_run, max_run, in_long_gap
         if (rg_idx + 1) % 500 == 0:
@@ -325,9 +330,7 @@ def apply_gap_exclusions(
     n_rg = pf.metadata.num_row_groups
     writer = None
 
-    for rg_idx in range(n_rg):
-        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
-
+    for rg_idx, market_df in iter_market_row_groups(pf):
         market_df = market_df.with_columns(
             (pl.col("in_gap") | pl.col("in_long_gap")).alias("exclude_from_training")
         )
@@ -340,7 +343,7 @@ def apply_gap_exclusions(
                 compression="SNAPPY",
                 version="2.6",
             )
-        writer.write_table(arrow_tbl)
+        write_market_table(writer, arrow_tbl)
 
         del market_df, arrow_tbl
         if (rg_idx + 1) % 500 == 0:

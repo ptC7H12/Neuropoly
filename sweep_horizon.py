@@ -46,12 +46,14 @@ import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 
+from pipeline.rowgroups import iter_market_row_groups
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import CostConfig, PipelineConfig
 from pipeline.aggregation import aggregate_trades
 from pipeline.data_loader import load_trades
-from pipeline.segments import SEGMENTS, load_segment_map
+from pipeline.segments import SEGMENTS, load_segment_map, segment_of
 from pipeline.gap_handler import (
     apply_gap_exclusions,
     detect_consecutive_gaps,
@@ -276,15 +278,14 @@ def main() -> int:
     pf = pq.ParquetFile(path)
     n_rg = pf.metadata.num_row_groups
     skipped_markets = 0
-    for rg in range(n_rg):
-        market_df = pl.from_arrow(pf.read_row_group(rg))
+    for rg, market_df in iter_market_row_groups(pf):
 
         # One row group is exactly one market, so the segment is a single
         # dict lookup — no join needed.
         market_segment = "other"
         if segment_map:
             mid = market_df["market_id"][0] if market_df.height else None
-            market_segment = segment_map.get(int(mid), "other") if mid is not None else "other"
+            market_segment = segment_of(mid, segment_map)
             if args.segment and market_segment != args.segment:
                 skipped_markets += 1
                 del market_df
