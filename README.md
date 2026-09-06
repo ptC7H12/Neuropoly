@@ -42,6 +42,9 @@ mv results_log.jsonl results_log.old.jsonl 2>/dev/null || true
 markets.csv + orderFilled.csv
         |
         v
+[0] sweep_horizon.py            Traegt sich die Haltedauer? (vor allem anderen)
+        |
+        v
 [1] convert_to_parquet.py       CSV → Parquet (chunk-weise, < 1 GB RAM)
         |
         v
@@ -83,6 +86,74 @@ source venv/bin/activate
 ```bash
 pip install -r requirements.txt
 ```
+
+---
+
+## Phase 0 — Traegt sich die Haltedauer? (`sweep_horizon.py`)
+
+Bevor du ein Modell trainierst: pruefe, ob im gewaehlten Label-Fenster
+ueberhaupt genug Preisbewegung steckt, um die Handelskosten zu bezahlen.
+
+```bash
+python sweep_horizon.py \
+    --trades data/trades.parquet --markets data/markets.parquet \
+    --windows 3 6 12 24 48 96 288 --by-band
+```
+
+Ausgabe:
+
+```
+    Horizon      Labeled    MedianRet     p90Ret  MedianCost   Ret>Cost   MaxROI*
+  ----------------------------------------------------------------------------
+     15 min       46,574      0.121%    1.745%     10.01%     0.06%   +4.71%
+     30 min       46,558      0.870%    2.933%      9.94%     0.36%   +7.26%
+        1 h       46,520      1.315%    4.339%      9.91%     1.38%   +9.13%
+        2 h       46,443      1.934%    6.312%      9.83%     4.12%  +10.50%
+        4 h       46,292      2.843%    8.975%      9.73%    10.38%   +9.59%
+        8 h       45,984      4.031%   12.618%      9.72%    22.11%   +9.98%
+        1 d       44,808      6.894%   20.137%      9.58%    46.25%  +10.64%
+```
+
+| Spalte | Bedeutung |
+|---|---|
+| `MedianRet` | Rendite der **besseren** der beiden Seiten (YES oder NO) |
+| `MedianCost` | Round-Trip-Kosten genau dieser Seite |
+| `Ret>Cost` | Anteil der Buckets, in denen diese Rendite ihre Kosten schlaegt |
+| `MaxROI*` | ROI bei **perfekter Voraussicht** — nur diese Buckets handeln und immer die richtige Seite treffen |
+
+**`Ret>Cost` ist die Entscheidungszahl.** Sie ist eine Obergrenze: sie
+unterstellt, dass du fuer jeden Bucket die bessere Seite kennst. Liegt sie
+unter ~5 %, kann kein Modell profitabel werden — dann ist nicht das Modell
+das Problem, sondern die Haltedauer. Kein Grund, an Features oder am Label
+zu drehen; erst laengere Fenster probieren.
+
+Beide Seiten werden dabei getrennt gerechnet. Eine YES- und eine NO-Share
+desselben Marktes sind keine Spiegelbilder: bei P(YES) = 0.20 kostet die
+YES-Share 0.20 und die NO-Share 0.80. Ein Preisrutsch auf 0.19 ist deshalb
+−5,0 % auf der YES-Seite, aber +1,25 % auf der NO-Seite — bei 13 % gegen
+3,2 % Kosten.
+
+Mit `--by-band` kommt eine Aufschluesselung nach Tokenpreis dazu. Weil die
+Kosten mit `1/Preis` skalieren, kann ein Horizont in der liquiden Mitte
+funktionieren und an den Raendern hoffnungslos sein — oder umgekehrt.
+
+Das Ergebnis haengt stark an `--spread-abs` (Default 0.010, der gemessene
+Median). Mit 0.002 springt `Ret>Cost` bei 30 Minuten von 0,36 % auf 7,61 %.
+Setz den Wert auf das, was du in deinen Maerkten wirklich siehst.
+
+| Parameter | Default | Beschreibung |
+|---|---|---|
+| `--trades` / `--markets` | `data/*.parquet` | Datenpfade |
+| `--windows` | `3 6 12 24 48 96 288` | Horizonte in Buckets |
+| `--bucket-minutes` | `5` | Bucket-Groesse |
+| `--spread-abs` | `0.010` | Absoluter Spread (siehe `CostConfig`) |
+| `--fee-legs` | `2` | Als Taker ueberquerte Legs |
+| `--by-band` | — | Zusaetzlich nach Tokenpreis aufschluesseln |
+| `--keep-intermediates` | — | Zwischendateien behalten |
+
+Der Sweep laeuft Bucketing und Luecken-Behandlung **einmal** und danach je
+Horizont nur noch das Labeling — Features werden gar nicht gebaut, sie
+spielen fuer diese Frage keine Rolle.
 
 ---
 
@@ -594,6 +665,8 @@ Neuropoly/
 ├── convert_to_parquet.py   [Phase 1] CSV → Parquet (chunk-weise, RAM-schonend)
 ├── run_pipeline.py         [Phase 1] Komplette Pipeline inkl. Training
 ├── train_chunked.py        [Phase 1] Inkrementelles Training (~25 GB RAM)
+│
+├── sweep_horizon.py        [Phase 0]  Traegt sich die Haltedauer ueberhaupt?
 │
 ├── evaluate_model.py       [Phase 2]  Modell auswerten ohne Neutraining
 ├── benchmark_strategies.py [Phase 2b] Klassische Strategien vs. Modell vergleichen

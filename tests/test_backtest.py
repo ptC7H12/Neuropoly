@@ -167,6 +167,42 @@ def test_binary_payoff_is_tagged():
     print("  binary payoff tagged")
 
 
+def test_sweep_picks_the_matching_side_and_price():
+    """
+    sweep_horizon's ceiling must pair each bucket's return with the price of
+    the side that produced it.
+
+    The tempting shortcut — |return of the dominant side|, priced at the
+    dominant side — is wrong twice over, because a YES share costs p and a
+    NO share 1-p.  At P(YES)=0.20 falling to 0.19 that shortcut claims a
+    5.0 % move where the NO side really pays 1.25 %, and charges 13 % of
+    cost where the NO side really costs 3.2 %.
+    """
+    from sweep_horizon import best_side
+
+    # One bucket: dominant YES at 0.20 loses, the NO side is the better bet
+    ret_dom = np.array([-0.05])          # (0.19-0.20)/0.20
+    ret_opp = np.array([+0.0125])        # (0.20-0.19)/(1-0.20)
+    px_dom = np.array([0.20])
+    px_opp = np.array([0.80])
+
+    ret, price = best_side(ret_dom, ret_opp, px_dom, px_opp)
+    assert ret[0] == ret_opp[0], "must take the better side's return"
+    assert price[0] == px_opp[0], "must take that same side's price"
+
+    cost = CostConfig()
+    assert cost.round_trip_cost(price[0]) < cost.round_trip_cost(px_dom[0])
+
+    # The naive shortcut would have claimed a 4x larger move
+    assert abs(ret_dom[0]) / ret_opp[0] == 4.0
+
+    # And where the dominant side wins, it is kept
+    ret2, price2 = best_side(np.array([0.03]), np.array([-0.01]),
+                             np.array([0.40]), np.array([0.60]))
+    assert ret2[0] == 0.03 and price2[0] == 0.40
+    print("  sweep side/price pairing correct")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  backtest invariants")
@@ -178,4 +214,5 @@ if __name__ == "__main__":
     test_untradeable_trades_are_skipped_not_booked()
     test_price_aware_cost_beats_flat_rate_where_it_matters()
     test_binary_payoff_is_tagged()
+    test_sweep_picks_the_matching_side_and_price()
     print("  ALL PASSED")
