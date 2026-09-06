@@ -405,6 +405,8 @@ def get_feature_columns(df) -> list[str]:
         "future_price",
         "trade_return",
         "trade_return_opp",
+        "entry_token_price",
+        "entry_token_price_opp",
         "question",
         "close_time",
         # Snapshot columns from the markets table: their value is the state

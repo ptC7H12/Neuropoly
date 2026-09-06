@@ -269,7 +269,8 @@ Erwartete Ausgabe:
   Win rate   : 61.2%      <- Preis lief in die richtige Richtung
   Profitable : 18.4%      <- davon nach Kosten im Plus
   Mean return: +0.412%    <- pro Trade, vor Kosten
-  ROI        : -1.6%      <- auf eingesetztes Kapital
+  Mean cost  : 9.8%       <- Spread + Gebuehr, skaliert mit 1/Preis
+  ROI        : -9.6%      <- auf eingesetztes Kapital
   Sharpe     : 0.09       <- pro Trade, nicht annualisiert
 ```
 
@@ -286,7 +287,8 @@ und produzierte dadurch ROI-Zahlen, die um Groessenordnungen zu hoch waren.
 | Brier Score | Kalibrierung | < 0.23 | > 0.25 = schlechter als Muenzwurf |
 | Win rate | Anteil Trades mit richtiger Preisrichtung | > 50% | — |
 | Profitable | Anteil Trades die **nach Kosten** Geld machten | > 50% | << Win rate = Bewegungen zu klein |
-| Mean return | Mittlere realisierte Rendite pro Trade | > `fee_rate` | < `fee_rate` = strukturell unprofitabel |
+| Mean return | Mittlere realisierte Rendite pro Trade | > Mean cost | < Mean cost = strukturell unprofitabel |
+| Mean cost | Mittlere Round-Trip-Kosten pro Trade | — | steigt stark bei billigen Tokens |
 | ROI (Backtest) | Gewinn / eingesetztes Kapital | > 0% | Negativ = Modell taugt nicht |
 | Sharpe (pro Trade) | Rendite / Streuung, **nicht** annualisiert | > 0.1 | < 0 = inkonsistente Ergebnisse |
 
@@ -303,11 +305,56 @@ Trade-Statistiken darueber decken trotzdem jeden qualifizierten Trade ab.
 **Win rate und Profitable auseinanderzuhalten ist der wichtigste Teil.**
 Das Label sagt nur, dass der Preis sich um mindestens `min_price_move`
 (0.001) in die richtige Richtung bewegt hat — nicht, um wie viel. Eine Share,
-die von 0.500 auf 0.501 laeuft, ist ein `win` und zahlt 0,2 %. Bei einer
-Round-Trip-Kostenannahme von 2 % (`BacktestConfig.fee_rate`) ist dieser Trade
-trotzdem ein Verlust. Eine Win rate von 98 % bei 14 % profitablen Trades ist
-ein voellig normales Ergebnis — und bedeutet: das Modell trifft die Richtung,
-aber die Bewegungen tragen die Kosten nicht.
+die von 0.500 auf 0.501 laeuft, ist ein `win` und zahlt 0,2 %. Die
+Round-Trip-Kosten liegen in diesem Preisbereich bei rund 10 % — der Trade ist
+also trotzdem ein Verlust. Eine Win rate von 98 % bei 1 % profitablen Trades
+ist ein voellig normales Ergebnis und bedeutet: das Modell trifft die
+Richtung, aber die Bewegungen tragen die Kosten nicht.
+
+### Das Kostenmodell (`CostConfig`)
+
+Handelskosten sind **kein** fester Prozentsatz. Sie werden in absoluten
+Preiseinheiten notiert (ein Spread sind so und so viele Ticks), eine Position
+ist aber nur `Tokenpreis` pro Share wert. Der relative Kostenanteil skaliert
+damit mit `1 / Tokenpreis`:
+
+```
+cost(tp) = ( spread_abs + fee_legs * fee_rate * min(tp, 1-tp) ) / tp
+```
+
+| Tokenpreis | Round-Trip-Kosten (Default) |
+|---|---|
+| 0.50 | 10 % |
+| 0.20 | 13 % |
+| 0.10 | 18 % |
+| 0.05 | 28 % |
+| 0.02 | 58 % |
+| 0.01 | 108 % |
+
+Gemessen an 120 aktiven Orderbuechern (Median-Spread nach Preisniveau):
+
+| min(p, 1-p) | Spread absolut | Spread / Preis |
+|---|---|---|
+| 0.35 – 0.50 | 0.0270 | 63 % |
+| 0.20 – 0.35 | 0.0200 | 8 % |
+| 0.10 – 0.20 | 0.0370 | 28 % |
+| 0.05 – 0.10 | 0.0160 | 23 % |
+| 0.02 – 0.05 | 0.0020 | 6 % |
+| 0.00 – 0.02 | 0.0010 | 40 % |
+
+**Kalibrierung:** `spread_abs` ist der einzige empirische Eingabewert und
+streut stark (Quartile ueber die 120 Buecher: 0.001 / 0.010 / 0.039). Der
+Default ist der Median. Setze ihn auf das, was du in *deinen* Maerkten
+tatsaechlich siehst — die `1/tp`-Form gilt unabhaengig von der Konstante.
+
+`fee_rate` ist Polymarkets eigener Satz (Gamma `feeSchedule.rate`, nur Taker):
+Gebuehr pro Share = `rate * min(p, 1-p)`. `fee_legs` ist die Anzahl der Legs,
+die du als Taker ueberquerst — 2 fuer rein und raus als Taker, 1 wenn du als
+Maker aussteigst, 0 fuer eine reine Maker-Strategie.
+
+Trades, deren Kosten `max_cost` (Default 1.0 = der ganze Positionswert)
+uebersteigen, werden als nicht handelbar uebersprungen und unter `Skipped`
+ausgewiesen — statt sie als Beinahe-Totalverlust zu verbuchen.
 
 ---
 
@@ -335,20 +382,24 @@ python benchmark_strategies.py \
 Erwartete Ausgabe (Vergleichstabelle auf dem TEST-Split):
 
 ```
-  Strategy         Dir     Cover     AUC   Brier  WinRate Profit%  Ret/Trd     ROI  Sharpe  Trades
-  -------------------------------------------------------------------------------------------------
-  baseline         follow  100.0%  0.5000  0.249   51.2%   19.1%  +0.412%   -4.0%  -0.012   45823
-  random           follow  100.0%  0.5001  0.250   51.2%   18.8%  +0.401%   -5.1%  -0.015   18350
-  momentum         follow   34.5%  0.5312  0.246   53.4%   24.7%  +0.688%   +4.2%   0.071     892
-  reversion        AGAINST  12.3%  0.5187  0.248   52.1%   21.3%  +0.551%   +2.1%   0.031     123
-  volume           follow    8.2%  0.5421  0.243   55.7%   27.9%  +0.914%   +6.8%   0.112     234
-  closing          follow    5.1%  0.5634  0.238   58.9%   31.2%  +1.203%   +9.2%   0.141      67
-  contrarian       AGAINST  18.7%  0.5023  0.251   51.3%   19.9%  +0.470%   +1.5%   0.022     456
+  Strategy         Dir     Cover     AUC   Brier  WinRate Profit%  Ret/Trd    Cost     ROI  Sharpe  Trades
+  ---------------------------------------------------------------------------------------------------------
+  baseline         follow  100.0%  0.5000  0.249   51.2%    1.1%  +0.412%   9.87%   -9.5%  -0.012   45823
+  random           follow  100.0%  0.5001  0.250   51.2%    0.9%  +0.401%   9.91%   -9.5%  -0.015   18350
+  momentum         follow   34.5%  0.5312  0.246   53.4%    2.7%  +0.688%   9.44%   -8.8%   0.071     892
+  reversion        AGAINST  12.3%  0.5187  0.248   52.1%    1.8%  +0.551%  11.20%  -10.7%   0.031     123
+  volume           follow    8.2%  0.5421  0.243   55.7%    3.4%  +0.914%   9.12%   -8.2%   0.112     234
+  closing          follow    5.1%  0.5634  0.238   58.9%    5.9%  +1.203%   8.90%   -7.7%   0.141      67
+  contrarian       AGAINST  18.7%  0.5023  0.251   51.3%    1.2%  +0.470%  14.51%  -14.0%   0.022     456
 ```
 
-`Ret/Trd` ist die mittlere realisierte Preisbewegung pro Trade **vor** Kosten.
-Liegt sie unter `fee_rate`, ist die Strategie strukturell unprofitabel, egal
-wie gut ihre AUC aussieht.
+`Ret/Trd` ist die mittlere realisierte Preisbewegung pro Trade **vor** Kosten,
+`Cost` sind die mittleren Round-Trip-Kosten. Liegt `Ret/Trd` unter `Cost`, ist
+die Strategie strukturell unprofitabel, egal wie gut ihre AUC aussieht.
+
+Dass `contrarian` die hoechsten Kosten hat, ist kein Zufall: die
+AGAINST-Strategien halten das komplementaere Token, das haeufig das billigere
+und damit relativ teurer zu handelnde ist.
 
 **Strategien im Ueberblick:**
 

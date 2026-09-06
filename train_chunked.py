@@ -139,11 +139,11 @@ def _process_chunk(
     markets_df: pl.DataFrame,
     cfg: PipelineConfig,
     chunk_start_actual,   # exclude context rows before this timestamp
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]] | None:
     """
     Run gap handling, features, and labeling on one chunk.
-    Returns (X, y, trade_returns, feature_names) for trainable rows in
-    [chunk_start_actual, end].  Returns None if no valid rows.
+    Returns (X, y, trade_returns, entry_prices, feature_names) for trainable
+    rows in [chunk_start_actual, end].  Returns None if no valid rows.
 
     Memory strategy: gap handling writes streaming Parquet (one row-group
     per market).  Then a **single** pass reads each row-group, computes
@@ -174,6 +174,7 @@ def _process_chunk(
     X_parts: list[np.ndarray] = []
     y_parts: list[np.ndarray] = []
     ret_parts: list[np.ndarray] = []
+    price_parts: list[np.ndarray] = []
     feature_cols: list[str] | None = None
     total_rows = 0
     total_labeled = 0
@@ -217,6 +218,9 @@ def _process_chunk(
             ret_parts.append(
                 trainable["trade_return"].to_numpy().astype(np.float64)
             )
+            price_parts.append(
+                trainable["entry_token_price"].to_numpy().astype(np.float64)
+            )
         del trainable
 
         if (rg_idx + 1) % 500 == 0 or (rg_idx + 1) == n_rg:
@@ -241,10 +245,11 @@ def _process_chunk(
     X = np.concatenate(X_parts)
     y = np.concatenate(y_parts)
     ret = np.concatenate(ret_parts)
-    del X_parts, y_parts, ret_parts
+    price = np.concatenate(price_parts)
+    del X_parts, y_parts, ret_parts, price_parts
     gc.collect()
 
-    return X, y, ret, feature_cols
+    return X, y, ret, price, feature_cols
 
 
 # ── LightGBM helpers ───────────────────────────────────────────────────────────
@@ -412,8 +417,8 @@ def main():
             t_chunk_start = t_chunk_end + timedelta(minutes=cfg.bucket.bucket_minutes)
             continue
 
-        X, y, _ret, feature_names = result
-        del _ret          # returns are only needed for the final backtest
+        X, y, _ret, _price, feature_names = result
+        del _ret, _price  # only needed for the final backtest
         print(f"    X shape: {X.shape} | positives: {int(y.sum()):,}")
 
         booster = _train_chunk(
@@ -454,7 +459,7 @@ def main():
         if result is None:
             print("  No testable rows.")
         else:
-            X_test, y_test, ret_test, _ = result
+            X_test, y_test, ret_test, price_test, _ = result
             y_pred = predict(booster, X_test)
             del X_test
             gc.collect()
@@ -466,6 +471,8 @@ def main():
             bt = backtest(
                 y_test, y_pred,
                 trade_returns=ret_test,
+                entry_prices=price_test,
+                cost=cfg.backtest.cost,
                 entry_threshold=cfg.backtest.entry_threshold,
                 fee_rate=cfg.backtest.fee_rate,
                 max_position_usd=cfg.backtest.max_position_usd,

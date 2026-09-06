@@ -119,12 +119,26 @@ def add_labels(
         .otherwise(_ret_yes)
         .fill_nan(None)
         .alias("trade_return_opp"),
+        # Price of the token actually held.  The backtest needs it because
+        # trading costs are quoted in absolute price units, so their share of
+        # a position scales with 1/price (see config.CostConfig).
+        pl.when(_yes_dominant)
+        .then(_entry)
+        .otherwise(1.0 - _entry)
+        .alias("entry_token_price"),
+        pl.when(_yes_dominant)
+        .then(1.0 - _entry)
+        .otherwise(_entry)
+        .alias("entry_token_price_opp"),
     )
 
     # Nullify targets for excluded or empty buckets.
     # Excluded: inside a known data gap.  Empty: no real trades in the bucket,
     # so mean_price is only a forward-filled carry-over — no real entry price.
-    _targets = ["win", "future_return", "trade_return", "trade_return_opp"]
+    _targets = [
+        "win", "future_return", "trade_return", "trade_return_opp",
+        "entry_token_price", "entry_token_price_opp",
+    ]
     for flag in ("exclude_from_training", "is_empty_bucket"):
         if flag not in df.columns:
             continue

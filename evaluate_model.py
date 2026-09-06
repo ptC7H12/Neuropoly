@@ -124,6 +124,7 @@ def _evaluate_split(
     X: np.ndarray,
     y: np.ndarray,
     ret: np.ndarray | None,
+    price: np.ndarray | None,
     booster,
     cfg: PipelineConfig,
 ) -> tuple[EvalMetrics, BacktestResult]:
@@ -132,6 +133,7 @@ def _evaluate_split(
     metrics = evaluate(y, y_pred, threshold=cfg.backtest.entry_threshold)
     bt = backtest(
         y, y_pred, trade_returns=ret,
+        entry_prices=price, cost=cfg.backtest.cost,
         entry_threshold=cfg.backtest.entry_threshold,
         fee_rate=cfg.backtest.fee_rate,
         max_position_usd=cfg.backtest.max_position_usd,
@@ -163,6 +165,7 @@ def print_split_eval(
         print(f"  Win rate   : {bt.win_rate:.2%}   (price moved the right way)")
         print(f"  Profitable : {bt.profit_rate:.2%}   (after fee)")
         print(f"  Mean return: {bt.mean_trade_return:+.4%} per trade")
+        print(f"  Mean cost  : {bt.mean_cost:.4%} per trade")
         print(f"  Total PnL  : ${bt.total_pnl:,.2f}  on ${bt.total_staked:,.2f} staked")
         print(f"  ROI        : {bt.roi:.2%}   (on deployed capital)")
         print(f"  Sharpe     : {bt.sharpe_ratio:.3f}  (per trade)")
@@ -244,6 +247,7 @@ def main() -> None:
     X_parts: list[np.ndarray] = []
     y_parts: list[np.ndarray] = []
     ret_parts: list[np.ndarray] = []
+    price_parts: list[np.ndarray] = []
     time_parts: list[np.ndarray] = []
     total_rows = 0
     total_labeled = 0
@@ -281,6 +285,9 @@ def main() -> None:
             ret_parts.append(
                 trainable["trade_return"].to_numpy().astype(np.float64)
             )
+            price_parts.append(
+                trainable["entry_token_price"].to_numpy().astype(np.float64)
+            )
             time_parts.append(
                 trainable["bucket_time"].to_physical().to_numpy()
             )
@@ -304,8 +311,9 @@ def main() -> None:
     X_all = np.concatenate(X_parts)
     y_all = np.concatenate(y_parts)
     ret_all = np.concatenate(ret_parts)
+    price_all = np.concatenate(price_parts)
     times_us = np.concatenate(time_parts)
-    del X_parts, y_parts, ret_parts, time_parts
+    del X_parts, y_parts, ret_parts, price_parts, time_parts
     gc.collect()
     print(f"  Trainable rows: {len(y_all):,}")
 
@@ -315,6 +323,7 @@ def main() -> None:
     X_all = X_all[sort_idx]
     y_all = y_all[sort_idx]
     ret_all = ret_all[sort_idx]
+    price_all = price_all[sort_idx]
     times_us = times_us[sort_idx]
     del sort_idx
     gc.collect()
@@ -355,12 +364,15 @@ def main() -> None:
         train_ret=ret_all[tr_sl],
         val_ret=ret_all[va_sl],
         test_ret=ret_all[te_sl],
+        train_price=price_all[tr_sl],
+        val_price=price_all[va_sl],
+        test_price=price_all[te_sl],
         train_end=train_end_time,
         val_start=val_start_time,
         val_end=val_end_time,
         test_start=test_start_time,
     )
-    del X_all, y_all, ret_all
+    del X_all, y_all, ret_all, price_all
     gc.collect()
     print_split_info(split)
 
@@ -423,12 +435,15 @@ def main() -> None:
 
     _split_log: dict[str, dict] = {}
     _results: dict[str, tuple] = {}
-    for split_name, X, y, ret, _key in [
-        ("TRAIN (in-sample — expect high)",   train_X, split.train_y, split.train_ret, "train"),
-        ("VALIDATION (out-of-sample)",         val_X,   split.val_y,   split.val_ret,   "val"),
-        ("TEST (final holdout — trust this)", test_X,  split.test_y,  split.test_ret,  "test"),
+    for split_name, X, y, ret, price, _key in [
+        ("TRAIN (in-sample — expect high)",   train_X, split.train_y,
+         split.train_ret, split.train_price, "train"),
+        ("VALIDATION (out-of-sample)",         val_X,   split.val_y,
+         split.val_ret,   split.val_price,   "val"),
+        ("TEST (final holdout — trust this)", test_X,  split.test_y,
+         split.test_ret,  split.test_price,  "test"),
     ]:
-        m, bt = _evaluate_split(X, y, ret, booster, cfg)
+        m, bt = _evaluate_split(X, y, ret, price, booster, cfg)
         print_split_eval(split_name, m, bt, cfg.backtest.entry_threshold)
         _results[_key] = (m, bt)
         _split_log[_key] = {
@@ -443,6 +458,8 @@ def main() -> None:
             "win_rate":  round(bt.win_rate, 4),
             "profit_rate": round(bt.profit_rate, 4),
             "mean_ret":  round(bt.mean_trade_return, 6),
+            "mean_cost": round(bt.mean_cost, 6),
+            "skipped":   bt.skipped_untradeable,
         }
 
     # Full evaluation printout for test set (includes equity curve + calibration).

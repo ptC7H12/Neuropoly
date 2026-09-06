@@ -128,15 +128,17 @@ def _run_eval(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     trade_returns: np.ndarray,
+    entry_prices: np.ndarray,
     cfg: PipelineConfig,
 ) -> tuple[EvalMetrics, BacktestResult]:
-    """Evaluate and run backtest on a (y_true, y_pred, trade_returns) triple."""
+    """Evaluate and run backtest on one strategy's arrays."""
 
     # Remove NaN / inf
     valid = np.isfinite(y_pred) & np.isfinite(y_true)
     y_true = y_true[valid]
     y_pred = np.clip(y_pred[valid], 1e-7, 1.0 - 1e-7)
     trade_returns = trade_returns[valid]
+    entry_prices = entry_prices[valid]
 
     if len(y_true) < 10:
         raise ValueError("Too few valid rows for evaluation")
@@ -148,6 +150,8 @@ def _run_eval(
         y_true,
         y_pred,
         trade_returns=trade_returns,
+        entry_prices=entry_prices,
+        cost=cfg.backtest.cost,
         entry_threshold=cfg.backtest.entry_threshold,
         fee_rate=cfg.backtest.fee_rate,
         max_position_usd=cfg.backtest.max_position_usd,
@@ -452,6 +456,7 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
         f"{'WinRate':>8}"
         f"{'Profit%':>8}"
         f"{'Ret/Trd':>9}"
+        f"{'Cost':>8}"
         f"{'ROI':>8}"
         f"{'Sharpe':>7}"
         f"{'Trades':>7}"
@@ -476,6 +481,7 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
             f"{bt.win_rate:>7.1%} "
             f"{bt.profit_rate:>7.1%} "
             f"{bt.mean_trade_return:>+9.3%}"
+            f"{bt.mean_cost:>8.2%}"
             f"{bt.roi:>+8.1%}"
             f"{bt.sharpe_ratio:>7.3f}"
             f"{bt.total_trades:>7}"
@@ -489,7 +495,9 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
         f"  Cover       → % of test rows where strategy fires a signal\n"
         f"  WinRate     → % of trades where the price moved the right way\n"
         f"  Profit%     → % of trades that made money AFTER the fee\n"
-        f"  Ret/Trd     → mean realised return per trade (before the fee)\n"
+        f"  Ret/Trd     → mean realised return per trade (before costs)\n"
+        f"  Cost        → mean round-trip cost per trade; scales with 1/price,\n"
+        f"                so it is far higher on extreme-priced markets\n"
         f"  AUC/Brier   → ML metrics on the strategy's own win criterion\n"
         f"  ROI         → PnL / deployed capital — independent of bankroll size\n"
         f"  Sharpe      → per trade, NOT annualised\n"
@@ -527,6 +535,10 @@ def _print_strategy_detail(r: StrategyResult, threshold: float) -> None:
         print(f"  Win rate   : {bt.win_rate:.2%}   (price moved the right way)")
         print(f"  Profitable : {bt.profit_rate:.2%}   (after fee)")
         print(f"  Mean return: {bt.mean_trade_return:+.4%} per trade")
+        print(f"  Mean cost  : {bt.mean_cost:.4%} per trade")
+        if bt.skipped_untradeable:
+            print(f"  Skipped    : {bt.skipped_untradeable} untradeable "
+                  f"(cost above position value)")
         print(f"  Total PnL  : ${bt.total_pnl:,.2f}  on ${bt.total_staked:,.2f} staked")
         print(f"  ROI        : {bt.roi:+.2%}   (on deployed capital)")
         print(f"  Sharpe     : {bt.sharpe_ratio:.3f}  (per trade)")
@@ -694,9 +706,12 @@ def main() -> None:
             # A strategy that bets AGAINST the dominant side holds the
             # complementary token, so it realises the opposite return.
             ret_col = "trade_return" if direction == "follow" else "trade_return_opp"
+            price_col = ("entry_token_price" if direction == "follow"
+                         else "entry_token_price_opp")
             returns = test_df[ret_col].to_numpy().astype(np.float64)
+            prices = test_df[price_col].to_numpy().astype(np.float64)
 
-            metrics, bt = _run_eval(y_true, y_pred, returns, cfg)
+            metrics, bt = _run_eval(y_true, y_pred, returns, prices, cfg)
             results.append(StrategyResult(
                 name=name, description=description,
                 bet_direction=direction,

@@ -247,6 +247,8 @@ def main():
         split.test_y,
         y_pred,
         trade_returns=split.test_ret,
+        entry_prices=split.test_price,
+        cost=cfg.backtest.cost,
         entry_threshold=cfg.backtest.entry_threshold,
         fee_rate=cfg.backtest.fee_rate,
         max_position_usd=cfg.backtest.max_position_usd,

@@ -14,7 +14,10 @@ Backtesting:
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from config import CostConfig
 
 
 @dataclass
@@ -50,6 +53,10 @@ class BacktestResult:
     profitable_trades: int = 0
     profit_rate: float = 0.0
     mean_trade_return: float = 0.0
+    # Mean round-trip cost actually charged, as a fraction of the position
+    mean_cost: float = 0.0
+    # Candidate trades dropped because their cost exceeded CostConfig.max_cost
+    skipped_untradeable: int = 0
 
     total_pnl: float = 0.0
     total_staked: float = 0.0
@@ -151,6 +158,8 @@ def backtest(
     y_true: np.ndarray,
     y_pred_proba: np.ndarray,
     trade_returns: Optional[np.ndarray] = None,
+    entry_prices: Optional[np.ndarray] = None,
+    cost: Optional["CostConfig"] = None,
     entry_threshold: float = 0.6,
     fee_rate: float = 0.02,
     max_position_usd: float = 100.0,
@@ -175,9 +184,36 @@ def backtest(
     binary payoff (+stake on a win, -stake on a loss).  That model does NOT
     describe a prediction market and massively overstates ROI; the result is
     tagged with payoff_model="binary" so callers can flag it.
+
+    Costs
+    -----
+    With `entry_prices` (the price of the token held) and a `CostConfig`, the
+    round-trip cost is computed per trade and scales with 1/price — a spread
+    is quoted in absolute price units, so it eats a far larger share of a
+    position at 0.02 than at 0.50.  Trades whose cost exceeds
+    CostConfig.max_cost are skipped as untradeable and counted in
+    `skipped_untradeable`.
+
+    Without entry prices the flat `fee_rate` is used, which understates the
+    cost of exactly the trades that look most attractive.
     """
 
     use_returns = trade_returns is not None
+
+    # Per-trade round-trip cost, as a fraction of the position
+    if entry_prices is not None and cost is not None:
+        costs = np.asarray(cost.round_trip_cost(np.asarray(entry_prices)),
+                           dtype=np.float64)
+        if len(costs) != len(y_true):
+            raise ValueError(
+                f"entry_prices has {len(costs)} rows but y_true has "
+                f"{len(y_true)} — they must be aligned row for row."
+            )
+        max_cost = cost.max_cost
+    else:
+        costs = np.full(len(y_true), float(fee_rate), dtype=np.float64)
+        max_cost = np.inf
+
     if use_returns:
         trade_returns = np.asarray(trade_returns, dtype=np.float64)
         if len(trade_returns) != len(y_true):
@@ -208,6 +244,8 @@ def backtest(
     profitable = 0
     total = 0
     total_staked = 0.0
+    skipped_untradeable = 0
+    trade_costs = []
     ruined = False
 
     for i in range(len(y_true)):
@@ -220,6 +258,14 @@ def backtest(
         if use_returns and not np.isfinite(trade_returns[i]):
             continue
 
+        trade_cost = costs[i]
+        if not np.isfinite(trade_cost) or trade_cost > max_cost:
+            # The spread alone would swallow the position — no such trade
+            # exists in practice, so booking it as a near-total loss would be
+            # as wrong as pretending it was cheap.
+            skipped_untradeable += 1
+            continue
+
         # Position sizing
         if kelly_sizing:
             # Kelly sizes off the running bankroll, so this path cannot
@@ -229,7 +275,7 @@ def backtest(
             # Kelly fraction: f* = (p*b - q) / b
             # For binary outcome with even odds: f* = 2p - 1
             # With fee adjustment
-            b = 1.0 - fee_rate  # Net odds
+            b = 1.0 - trade_cost  # Net odds
             q = 1.0 - p_win
             kelly_f = (p_win * b - q) / b
             kelly_f = max(0, min(kelly_f, kelly_cap))
@@ -254,15 +300,16 @@ def backtest(
             # Realised price move minus round-trip cost (fee + spread proxy),
             # both as a fraction of the notional stake.
             ret = float(trade_returns[i])
-            pnl = stake * (ret - fee_rate)
+            pnl = stake * (ret - trade_cost)
             trade_rets.append(ret)
         else:
             # Legacy even-money model — kept only for backwards compatibility
             if actual_win == 1:
-                pnl = stake * (1.0 - fee_rate)
+                pnl = stake * (1.0 - trade_cost)
             else:
                 pnl = -stake
             trade_rets.append(pnl / stake)
+        trade_costs.append(trade_cost)
 
         if actual_win == 1:
             winning += 1
@@ -297,6 +344,8 @@ def backtest(
         profitable_trades=profitable,
         profit_rate=profitable / total if total > 0 else 0.0,
         mean_trade_return=float(np.mean(trade_rets)) if trade_rets else 0.0,
+        mean_cost=float(np.mean(trade_costs)) if trade_costs else 0.0,
+        skipped_untradeable=skipped_untradeable,
         total_pnl=float(np.sum(trade_pnls)) if trade_pnls else 0.0,
         total_staked=total_staked,
         roi=(float(np.sum(trade_pnls)) / total_staked) if total_staked > 0 else 0.0,
@@ -355,6 +404,10 @@ def print_evaluation(metrics: EvalMetrics, bt: BacktestResult) -> None:
     print(f"    Win rate:         {bt.win_rate:.2%}   (price moved the right way)")
     print(f"    Profitable:       {bt.profit_rate:.2%}   (after {'' if bt.payoff_model == 'binary' else 'the '}fee)")
     print(f"    Mean return/trade:{bt.mean_trade_return:+.4%}")
+    print(f"    Mean cost/trade:  {bt.mean_cost:.4%}   (spread + fee, scales with 1/price)")
+    if bt.skipped_untradeable:
+        print(f"    Skipped:          {bt.skipped_untradeable} candidate(s) whose cost "
+              f"exceeded the position value")
     print(f"    Total PnL:        ${bt.total_pnl:,.2f}  on ${bt.total_staked:,.2f} staked")
     print(f"    ROI on capital:   {bt.roi:.2%}   <- the strategy")
     print(f"    Sharpe (per trade):{bt.sharpe_ratio:.3f}")

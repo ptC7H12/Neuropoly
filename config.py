@@ -172,19 +172,87 @@ class MonitorConfig:
 
 
 @dataclass
+class CostConfig:
+    """
+    Round-trip trading cost, as a fraction of the position's value.
+
+        cost(tp) = ( spread_abs + fee_legs * fee_rate * min(tp, 1-tp) ) / tp
+
+    where `tp` is the price of the token actually held (P(YES) for a YES
+    position, 1 - P(YES) for a NO one).
+
+    Why it cannot be a flat percentage
+    ----------------------------------
+    Costs are quoted in absolute price units — a spread is so many ticks —
+    but a position's value is `tp` per share.  The relative cost therefore
+    scales with 1/tp, and at the price extremes it explodes.  Measured on
+    120 live order books:
+
+        min(p, 1-p)      median spread   spread / price
+        0.35 - 0.50           0.0270            63 %
+        0.20 - 0.35           0.0200             8 %
+        0.10 - 0.20           0.0370            28 %
+        0.05 - 0.10           0.0160            23 %
+        0.02 - 0.05           0.0020             6 %
+        0.00 - 0.02           0.0010            40 %
+
+    A flat rate hides that completely, and the direction of the error is the
+    dangerous one: it makes cheap-looking trades out of the markets where
+    trading is in fact most expensive.
+
+    Calibration
+    -----------
+    `spread_abs` is the one empirical input and it varies a lot between
+    markets — across those 120 books the quartiles were 0.001 / 0.010 /
+    0.039.  The default is the median.  Set it from the markets you actually
+    trade; the 1/tp shape holds regardless of the constant.
+
+    `fee_rate` is Polymarket's own schedule (Gamma `feeSchedule.rate`,
+    taker-only): fee per share = rate * min(p, 1-p).  `fee_legs` is how many
+    legs you cross as taker — 2 for taker in and out, 1 if you expect to
+    exit as maker, 0 for a pure maker strategy.
+    """
+
+    # Absolute bid/ask spread in price units, paid once per round trip
+    spread_abs: float = 0.010
+
+    # Polymarket taker fee rate (Gamma feeSchedule.rate)
+    fee_rate: float = 0.04
+
+    # Number of legs crossed as taker (0, 1 or 2)
+    fee_legs: int = 2
+
+    # Trades whose round-trip cost exceeds this fraction of the position are
+    # treated as untradeable and skipped, instead of being booked as a
+    # near-total loss.  1.0 = "the costs eat the whole position".
+    max_cost: float = 1.0
+
+    def round_trip_cost(self, token_price):
+        """
+        Cost of entering and exiting, as a fraction of the position's value.
+
+        Accepts a float or a numpy array.
+        """
+        import numpy as np
+
+        tp = np.clip(np.asarray(token_price, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+        fee = self.fee_legs * self.fee_rate * np.minimum(tp, 1.0 - tp)
+        cost = (self.spread_abs + fee) / tp
+        return cost if cost.ndim else float(cost)
+
+
+@dataclass
 class BacktestConfig:
     """Backtesting / evaluation settings."""
 
     # Probability threshold to enter a trade
     entry_threshold: float = 0.6
 
-    # Round-trip trading cost per trade, as a fraction of the notional stake.
-    # Covers exchange fee + bid/ask spread + slippage.
-    #
-    # IMPORTANT: at the default 30-minute label horizon the realised price
-    # move is on the order of 1 %, so this number dominates the backtest
-    # result.  Set it to what you actually pay — 0.02 is a conservative
-    # placeholder, not a measured Polymarket fee.
+    # Price-aware round-trip cost model (see CostConfig).
+    cost: "CostConfig" = field(default_factory=lambda: CostConfig())
+
+    # Flat fallback cost, as a fraction of the stake.  Only used when the
+    # backtest is given no entry prices to compute a per-trade cost from.
     fee_rate: float = 0.02
 
     # Max position size (USD)

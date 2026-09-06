@@ -14,6 +14,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from config import CostConfig
 from pipeline.evaluation import backtest
 
 
@@ -90,6 +91,74 @@ def test_roi_equals_mean_return_minus_fee():
           f"= {bt.mean_trade_return:+.3%} - {_KW['fee_rate']:.1%}")
 
 
+def test_cost_scales_with_one_over_price():
+    """
+    Trading costs are quoted in absolute price units, so their share of a
+    position grows as the token gets cheaper.  A flat rate hides that, and
+    it hides it in the dangerous direction: the extreme-priced markets that
+    show the biggest percentage moves are also the most expensive to trade.
+
+    Measured on 120 live order books, the median spread was ~0.010 in
+    absolute terms; at a token price of 0.50 that is 2 % of the position,
+    at 0.02 it is 50 %.
+    """
+    cost = CostConfig(spread_abs=0.010, fee_rate=0.04, fee_legs=2)
+
+    mid = cost.round_trip_cost(0.50)
+    edge = cost.round_trip_cost(0.02)
+    assert mid < 0.15, f"cost at 0.50 should stay modest, got {mid:.1%}"
+    assert edge > 5 * mid, (
+        f"cost at 0.02 ({edge:.1%}) should dwarf cost at 0.50 ({mid:.1%})"
+    )
+
+    # Monotonically decreasing in price across the whole range
+    prices = np.array([0.005, 0.01, 0.05, 0.1, 0.2, 0.35, 0.5])
+    costs = cost.round_trip_cost(prices)
+    assert np.all(np.diff(costs) < 0), f"cost must fall as price rises: {costs}"
+    print(f"  cost 0.50 -> {mid:.1%},  0.02 -> {edge:.1%}")
+
+
+def test_untradeable_trades_are_skipped_not_booked():
+    """
+    Where the round-trip cost exceeds the position's value there is no trade
+    to make.  Booking it as a near-total loss would be as wrong as pretending
+    it was cheap, so it must be skipped and counted.
+    """
+    y, pred, ret = _signal(n=400)
+    # Half the candidates sit at a price where the spread alone eats the
+    # position; the other half in the liquid middle.
+    prices = np.where(np.arange(len(y)) % 2 == 0, 0.004, 0.50)
+    cost = CostConfig(spread_abs=0.010, fee_rate=0.04, fee_legs=2, max_cost=1.0)
+
+    bt = backtest(y, pred, trade_returns=ret, entry_prices=prices, cost=cost,
+                  initial_bankroll=100.0, **_KW)
+
+    assert bt.skipped_untradeable > 0, "cheap-token trades were not skipped"
+    assert bt.total_trades > 0, "liquid trades were skipped too"
+    # Only the 0.50 trades survive, so the mean cost must match that price
+    assert abs(bt.mean_cost - cost.round_trip_cost(0.50)) < 1e-9
+    print(f"  skipped {bt.skipped_untradeable} untradeable, "
+          f"kept {bt.total_trades} at mean cost {bt.mean_cost:.1%}")
+
+
+def test_price_aware_cost_beats_flat_rate_where_it_matters():
+    """A flat 2 % makes extreme-priced trades look profitable when they are not."""
+    y, pred, ret = _signal(n=1000)
+    prices = np.full(len(y), 0.02)          # cheap token: costly to trade
+    cost = CostConfig(spread_abs=0.010, fee_rate=0.04, fee_legs=2, max_cost=10.0)
+
+    flat = backtest(y, pred, trade_returns=ret, initial_bankroll=1e9, **_KW)
+    aware = backtest(y, pred, trade_returns=ret, entry_prices=prices, cost=cost,
+                     initial_bankroll=1e9, **_KW)
+
+    assert flat.mean_cost < aware.mean_cost, (
+        f"flat {flat.mean_cost:.1%} should understate {aware.mean_cost:.1%}"
+    )
+    assert aware.roi < flat.roi
+    print(f"  flat cost {flat.mean_cost:.1%} -> ROI {flat.roi:+.1%};  "
+          f"price-aware {aware.mean_cost:.1%} -> ROI {aware.roi:+.1%}")
+
+
 def test_binary_payoff_is_tagged():
     """Calling without realised returns must be visible in the result."""
     y, pred, _ = _signal()
@@ -105,5 +174,8 @@ if __name__ == "__main__":
     test_strategy_stats_do_not_depend_on_bankroll()
     test_roi_is_order_independent()
     test_roi_equals_mean_return_minus_fee()
+    test_cost_scales_with_one_over_price()
+    test_untradeable_trades_are_skipped_not_booked()
+    test_price_aware_cost_beats_flat_rate_where_it_matters()
     test_binary_payoff_is_tagged()
     print("  ALL PASSED")

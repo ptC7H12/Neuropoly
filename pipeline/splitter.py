@@ -39,6 +39,12 @@ class SplitResult:
     val_ret: np.ndarray | None = None
     test_ret: np.ndarray | None = None
 
+    # Price of the token held, aligned row-for-row.  The backtest needs it to
+    # size trading costs, which scale with 1/price.
+    train_price: np.ndarray | None = None
+    val_price: np.ndarray | None = None
+    test_price: np.ndarray | None = None
+
     # Time boundaries for reference
     train_end: object = None
     val_start: object = None
@@ -169,10 +175,10 @@ def walk_forward_split(
     def _y(part: pl.DataFrame) -> np.ndarray:
         return part["win"].to_numpy().astype(np.float32)
 
-    def _ret(part: pl.DataFrame) -> np.ndarray | None:
-        if "trade_return" not in part.columns:
+    def _col(part: pl.DataFrame, name: str) -> np.ndarray | None:
+        if name not in part.columns:
             return None
-        return part["trade_return"].to_numpy().astype(np.float64)
+        return part[name].to_numpy().astype(np.float64)
 
     return SplitResult(
         train_X=_X(train_df),
@@ -182,9 +188,12 @@ def walk_forward_split(
         test_X=_X(test_df),
         test_y=_y(test_df),
         feature_names=existing_features,
-        train_ret=_ret(train_df),
-        val_ret=_ret(val_df),
-        test_ret=_ret(test_df),
+        train_ret=_col(train_df, "trade_return"),
+        val_ret=_col(val_df, "trade_return"),
+        test_ret=_col(test_df, "trade_return"),
+        train_price=_col(train_df, "entry_token_price"),
+        val_price=_col(val_df, "entry_token_price"),
+        test_price=_col(test_df, "entry_token_price"),
         train_end=train_df["bucket_time"].max(),
         val_start=val_df["bucket_time"].min(),
         val_end=val_df["bucket_time"].max(),
