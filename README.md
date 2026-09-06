@@ -157,6 +157,56 @@ spielen fuer diese Frage keine Rolle.
 
 ---
 
+### Segmente: Sport, Krypto, Politik trennen
+
+`markets.csv` hat kein Kategorie-Feld, und Polymarkets Gamma-API taggt nur
+noch **offene** Maerkte: von 100 geschlossenen hatte keiner einen brauchbaren
+Segment-Tag (nur den Platzhalter `All`), aktive dagegen zu 100 %. Ein
+historischer Datensatz besteht fast nur aus geschlossenen Maerkten.
+
+Deshalb wird aus dem `market_slug` klassifiziert — und gegen die API-Tags der
+noch aktiven Maerkte benotet:
+
+```bash
+python classify_markets.py --markets data/markets.parquet \
+    --out data/market_segments.parquet --validate
+```
+
+`--validate` gibt eine Konfusionsmatrix und Precision/Recall je Segment aus.
+Gemessen an 1.309 aktiven Maerkten:
+
+| Segment | Precision | Recall |
+|---|---|---|
+| sports | 100,0 % | 97,4 % |
+| crypto | 100,0 % | 72,5 % |
+| politics | 100,0 % | 84,0 % |
+
+Precision zaehlt hier mehr als Recall: was als `sports` markiert ist, soll
+auch Sport sein. Unklares landet absichtlich in `other` statt geraten zu
+werden — ein zu eifriger Filter wuerde sonst still auf den falschen Daten
+trainieren.
+
+Damit dann die Diagnose je Segment:
+
+```bash
+python sweep_horizon.py --trades data/trades.parquet \
+    --segments data/market_segments.parquet --windows 6 24 96 288 --by-segment
+
+# oder nur ein Segment
+python sweep_horizon.py ... --segments data/market_segments.parquet \
+    --segment sports --by-band
+```
+
+**So entscheidest du ueber getrennte Modelle:** unterscheiden sich `Ret>Cost`
+und `MedianCost` zwischen den Segmenten deutlich, lohnt die Trennung. Sind
+sie aehnlich, ist `segment` als kategoriales Feature in **einem** Modell der
+guenstigere Weg — LightGBM splittet selbst darauf, und jedes Teilmodell
+bekaeme sonst weniger Daten.
+
+`benchmark_strategies.py` nimmt dieselben Flags (`--segments`, `--segment`).
+
+---
+
 ## Phase 1 — Daten vorbereiten und Modell trainieren
 
 ### Schritt 1: CSV nach Parquet konvertieren
@@ -483,6 +533,19 @@ und damit relativ teurer zu handelnde ist.
 | `volume` | follow | Ungewoehnlich hohes Volumen = Smart Money, Richtung folgen |
 | `closing` | follow | Nahe Markt-Ende konvergieren Preise zur echten Wahrscheinlichkeit |
 | `contrarian` | AGAINST | Wenn yes_ratio UND Preis beide extrem sind — gegen die Masse wetten |
+| `favourite` | mixed | Immer die **teure** Seite kaufen (testet Longshot-Ueberbewertung) |
+| `longshot` | mixed | Immer die **billige** Seite kaufen — die woertliche Lesart von „gegen den Markt" |
+
+**Dir=mixed** waehlt die Seite pro Zeile, nicht pro Strategie: ob der Favorit
+die dominante Seite ist, wechselt von Bucket zu Bucket. Solche Strategien
+geben ein zusaetzliches `take_dominant`-Array zurueck; Rendite **und** Preis
+werden dann aus derselben Seite genommen.
+
+`favourite` und `longshot` sind exakte Komplemente — gleiche Trade-Anzahl,
+gegensaetzliche Seite. Der strukturelle Unterschied sind die Kosten: in einem
+Testlauf 5,08 % gegen 11,91 %, weil die billige Seite bei `1/Preis`-Kosten
+die teure zu handeln ist. „Immer gegen den Markt" ist damit systematisch die
+teuerste Variante, nicht die lukrativste.
 
 **Dir=follow** benutzt das originale `win`-Label (Wette MIT der Marktmehrheit).
 **Dir=AGAINST** flippt das Label — ROI > 0 bedeutet: die Masse liegt systematisch falsch.
@@ -666,6 +729,7 @@ Neuropoly/
 ├── run_pipeline.py         [Phase 1] Komplette Pipeline inkl. Training
 ├── train_chunked.py        [Phase 1] Inkrementelles Training (~25 GB RAM)
 │
+├── classify_markets.py     [Phase 0]  Segment-Map bauen (Sport/Krypto/Politik)
 ├── sweep_horizon.py        [Phase 0]  Traegt sich die Haltedauer ueberhaupt?
 │
 ├── evaluate_model.py       [Phase 2]  Modell auswerten ohne Neutraining
@@ -688,11 +752,14 @@ Neuropoly/
 │   ├── monitor.py          Live-Dashboard
 │   ├── evaluation.py       Metriken + Backtest
 │   ├── polymarket_api.py   Gamma- + data-api-Zugriff (gemeinsam genutzt)
+│   ├── segments.py         Markt-Segmentierung aus dem Slug
 │   ├── live_features.py    Live-Features ueber die Trainings-Codepfade
 │   └── results_logger.py   Historisches Ergebnis-Log
 └── tests/
     ├── test_pipeline_e2e.py           E2E-Test mit Fake-Daten
     ├── test_data_loader.py            Preis-Normalisierung
+    ├── test_segments.py               Segmentierung + favourite/longshot
+    ├── test_backtest.py               Backtest-Invarianten
     └── test_streaming_equivalence.py  Batching == Einzelmarkt
 ```
 

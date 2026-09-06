@@ -36,14 +36,24 @@ DATA_API = "https://data-api.polymarket.com"
 # Max rows the data-api returns per request
 _PAGE_LIMIT = 500
 
+# Max market IDs Gamma returns per request.  Measured: asking for more just
+# returns 100, and omitting `limit` altogether silently caps the response at
+# 20 — which looks like missing markets rather than a paging limit.
+_GAMMA_ID_BATCH = 100
+
 
 class PolymarketAPIError(RuntimeError):
     """Raised when the API cannot be reached or answers with an error."""
 
 
-def _get(url: str, params: dict | None = None, timeout: int = 15,
+def _get(url: str, params: dict | list | None = None, timeout: int = 15,
          retries: int = 3) -> Any:
-    """GET with a small exponential backoff. Requires `requests`."""
+    """
+    GET with a small exponential backoff. Requires `requests`.
+
+    `params` may be a dict, or a list of (key, value) pairs when the same
+    key has to repeat — the Gamma batch lookup needs `?id=1&id=2&…`.
+    """
     try:
         import requests
     except ImportError as exc:  # pragma: no cover - environment issue
@@ -155,6 +165,67 @@ def fetch_market(token_id: str) -> Optional[MarketInfo]:
         ),
         raw=m,
     )
+
+
+def fetch_markets_by_id(
+    market_ids: list[int] | list[str],
+    include_tags: bool = True,
+    batch_size: int = _GAMMA_ID_BATCH,
+) -> dict[int, dict]:
+    """
+    Look up markets by their Gamma id, in batches.
+
+    Returns {market_id: market dict}.  IDs the API no longer serves are
+    simply absent — the caller decides what that means.
+
+    Three quirks are handled here, all measured against the live API:
+
+    * `limit` must be sent explicitly.  Without it the response is capped at
+      20 rows regardless of how many ids were asked for, which looks like
+      missing markets rather than a paging limit.
+    * The `closed` filter partitions the result rather than widening it.
+      Asking 10 active + 10 closed ids returns 10 active without `closed`,
+      and 10 closed with `closed=true` — never all 20.  So each batch is
+      requested twice and merged; omitting the second pass silently drops
+      every historical market.
+    * Closed markets carry no USABLE tags.  They do come back with a tag
+      list, but it holds only the placeholder "All" — 99 of 100 closed
+      markets in a sample, and 0 of 100 with a tag that identifies a
+      subject.  Active markets are tagged properly 100 % of the time.
+      So this lookup grades a classifier on the still-active subset; it
+      cannot label a historical dataset.
+    """
+    out: dict[int, dict] = {}
+    ids = [str(i) for i in market_ids]
+
+    for start in range(0, len(ids), batch_size):
+        chunk = ids[start:start + batch_size]
+        base: list[tuple[str, str]] = [("id", i) for i in chunk]
+        base.append(("limit", str(len(chunk))))
+        if include_tags:
+            base.append(("include_tag", "true"))
+
+        # Pass 1 picks up open markets, pass 2 the closed ones
+        for extra in ([], [("closed", "true")]):
+            page = _get(f"{GAMMA_API}/markets", params=base + extra)
+            if isinstance(page, dict):
+                page = page.get("data", [])
+            for m in page or []:
+                try:
+                    out[int(m["id"])] = m
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+    return out
+
+
+def market_tags(market: dict) -> list[str]:
+    """Tag labels of a Gamma market dict, empty if it carries none."""
+    return [
+        str(t.get("label", ""))
+        for t in (market.get("tags") or [])
+        if t and t.get("label")
+    ]
 
 
 def fetch_trades(

@@ -68,6 +68,7 @@ from pipeline.features import (
     report_degenerate_features,
 )
 from pipeline.labeling import add_labels_streaming, label_stats_lazy
+from pipeline.segments import SEGMENTS, load_segment_map
 from pipeline.splitter import walk_forward_split, print_split_info
 from pipeline.evaluation import evaluate, backtest, EvalMetrics, BacktestResult
 from pipeline.results_logger import append_to_log, print_log_history
@@ -98,6 +99,11 @@ def parse_args() -> argparse.Namespace:
                    help="Random seed for 'random' baseline strategy")
     p.add_argument("--keep-intermediates", action="store_true",
                    help="Keep temp Parquet files after run")
+    p.add_argument("--segments", default=None, metavar="PATH",
+                   help="Segment map from classify_markets.py")
+    p.add_argument("--segment", default=None, metavar="NAME",
+                   help="Restrict evaluation to one segment "
+                        f"({'/'.join(SEGMENTS)}); requires --segments")
     p.add_argument("--log-file", default="results_log.jsonl", metavar="PATH",
                    help="JSONL file to append results to for historical tracking "
                         "(default: results_log.jsonl). Pass '' to disable.")
@@ -428,6 +434,58 @@ def strat_contrarian(
     )
 
 
+# -- 8./9. Favourite and Longshot -------------------------------------------
+#
+# These answer the question "is the CHEAP side systematically mispriced?" —
+# the well-posed version of "bet against the market".  contrarian/reversion
+# answer something else: they bet against the bucket's trade FLOW.
+#
+# Both pick a side per ROW rather than per strategy, so they return the
+# optional 5th element `take_dominant`.
+
+def _side_by_price(df: pl.DataFrame, want_favourite: bool) -> tuple:
+    """
+    Buy the expensive side (favourite) or the cheap side (longshot).
+
+    `entry_token_price` is the price of the dominant side, `_opp` the
+    complementary one; they sum to 1.  Whether the favourite happens to be
+    the dominant side varies row by row, hence the per-row choice.
+    """
+    px_dom = _col(df, "entry_token_price")
+    px_opp = _col(df, "entry_token_price_opp")
+    if px_dom is None or px_opp is None:
+        return np.array([]), np.array([]), 0.0, "entry_token_price missing", None
+
+    win = df["win"].to_numpy().astype(np.float32)
+
+    dom_is_favourite = px_dom >= px_opp
+    take_dom = dom_is_favourite if want_favourite else ~dom_is_favourite
+
+    # `win` scores the dominant side, so taking the other side flips it
+    y_true = np.where(take_dom, win, 1.0 - win).astype(np.float32)
+
+    # Confidence = how lopsided the market is.  A 0.95/0.05 market is a
+    # stronger instance of "favourite" than a 0.51/0.49 one.
+    chosen_price = np.where(take_dom, px_dom, px_opp)
+    extremity = np.abs(chosen_price - 0.5) * 2.0
+    score = (0.5 + np.clip(extremity, 0.0, 1.0) * 0.5).astype(np.float32)
+
+    label = "favourite" if want_favourite else "longshot"
+    desc = (f"Always buy the {'expensive' if want_favourite else 'cheap'} "
+            f"side ({label})")
+    return y_true, score, 1.0, desc, take_dom
+
+
+def strat_favourite(df: pl.DataFrame) -> tuple:
+    """Buy the side the market considers likely. Tests longshot overpricing."""
+    return _side_by_price(df, want_favourite=True)
+
+
+def strat_longshot(df: pl.DataFrame) -> tuple:
+    """Buy the cheap side — the literal 'bet against the market' reading."""
+    return _side_by_price(df, want_favourite=False)
+
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -471,7 +529,8 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
             continue
         m  = r.metrics
         bt = r.bt
-        dir_tag = "follow" if r.bet_direction == "follow" else "AGAINST"
+        dir_tag = {"follow": "follow", "against": "AGAINST"}.get(
+            r.bet_direction, "mixed")
         print(
             f"  {r.name:<16}"
             f"{dir_tag:<8}"
@@ -489,7 +548,8 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
 
     print(sep)
     print(
-        f"\n  Dir=follow  → strategy bets WITH the dominant bucket side   (win = original label)\n"
+        f"\n  Dir=mixed   → strategy picks the side per ROW (favourite / longshot)\n"
+        f"  Dir=follow  → strategy bets WITH the dominant bucket side   (win = original label)\n"
         f"  Dir=AGAINST → strategy bets AGAINST the dominant side        "
         f"(win = flipped label = crowd is wrong)\n"
         f"  Cover       → % of test rows where strategy fires a signal\n"
@@ -664,6 +724,28 @@ def main() -> None:
         .sort("bucket_time")
     )
     test_df = labeled_all.filter(pl.col("bucket_time") >= split.test_start)
+
+    # Optional segment filter — test_df comes from labeled_all and already
+    # carries market_id, so this is a plain membership test.
+    if args.segment:
+        if not args.segments:
+            print("ERROR: --segment needs --segments PATH "
+                  "(build it with classify_markets.py).")
+            sys.exit(1)
+        if args.segment not in SEGMENTS:
+            print(f"ERROR: unknown segment '{args.segment}'. "
+                  f"Known: {', '.join(SEGMENTS)}")
+            sys.exit(1)
+        seg_map = load_segment_map(args.segments)
+        keep = [m for m, sg in seg_map.items() if sg == args.segment]
+        before = test_df.height
+        test_df = test_df.filter(pl.col("market_id").is_in(keep))
+        print(f"\n  Segment filter `{args.segment}`: "
+              f"{before:,} → {test_df.height:,} test rows "
+              f"({len(keep):,} markets in that segment)")
+        if test_df.height == 0:
+            print("  No test rows left in that segment — nothing to benchmark.")
+            sys.exit(1)
     del labeled_all
     gc.collect()
 
@@ -685,6 +767,8 @@ def main() -> None:
         ("volume",      "follow",  lambda df: strat_volume(df, spike_x=3.0)),
         ("closing",     "follow",  lambda df: strat_closing(df, max_days=14.0)),
         ("contrarian",  "against", lambda df: strat_contrarian(df, yr_thr=0.65, price_thr=0.65)),
+        ("favourite",   "mixed",   lambda df: strat_favourite(df)),
+        ("longshot",    "mixed",   lambda df: strat_longshot(df)),
     ]
 
     results: list[StrategyResult] = []
@@ -693,7 +777,16 @@ def main() -> None:
 
     for name, direction, fn in STRATEGIES:
         try:
-            y_true, y_pred, coverage, description = fn(test_df)
+            result = fn(test_df)
+            # Strategies may return a 5th element `take_dominant`: a per-row
+            # choice of side.  favourite/longshot need it because whether the
+            # favourite IS the dominant side changes from row to row; the
+            # older strategies keep a fixed direction and return 4 elements.
+            if len(result) == 5:
+                y_true, y_pred, coverage, description, take_dominant = result
+            else:
+                y_true, y_pred, coverage, description = result
+                take_dominant = None
 
             if len(y_true) == 0:
                 results.append(StrategyResult(
@@ -705,11 +798,20 @@ def main() -> None:
 
             # A strategy that bets AGAINST the dominant side holds the
             # complementary token, so it realises the opposite return.
-            ret_col = "trade_return" if direction == "follow" else "trade_return_opp"
-            price_col = ("entry_token_price" if direction == "follow"
-                         else "entry_token_price_opp")
-            returns = test_df[ret_col].to_numpy().astype(np.float64)
-            prices = test_df[price_col].to_numpy().astype(np.float64)
+            ret_dom = test_df["trade_return"].to_numpy().astype(np.float64)
+            ret_opp = test_df["trade_return_opp"].to_numpy().astype(np.float64)
+            px_dom = test_df["entry_token_price"].to_numpy().astype(np.float64)
+            px_opp = test_df["entry_token_price_opp"].to_numpy().astype(np.float64)
+
+            if take_dominant is not None:
+                # Per-row side, same pairing rule as sweep_horizon.best_side:
+                # the return and the price must come from the SAME side.
+                returns = np.where(take_dominant, ret_dom, ret_opp)
+                prices = np.where(take_dominant, px_dom, px_opp)
+            elif direction == "follow":
+                returns, prices = ret_dom, px_dom
+            else:
+                returns, prices = ret_opp, px_opp
 
             metrics, bt = _run_eval(y_true, y_pred, returns, prices, cfg)
             results.append(StrategyResult(

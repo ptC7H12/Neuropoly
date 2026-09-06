@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config import CostConfig, PipelineConfig
 from pipeline.aggregation import aggregate_trades
 from pipeline.data_loader import load_trades
+from pipeline.segments import SEGMENTS, load_segment_map
 from pipeline.gap_handler import (
     apply_gap_exclusions,
     detect_consecutive_gaps,
@@ -175,6 +176,15 @@ def parse_args() -> argparse.Namespace:
                    help="Taker legs crossed per round trip (0, 1 or 2)")
     p.add_argument("--by-band", action="store_true",
                    help="Also break the best horizon down by token price")
+    p.add_argument("--segments", default=None, metavar="PATH",
+                   help="Segment map from classify_markets.py "
+                        "(market_id -> sports/crypto/politics/other)")
+    p.add_argument("--by-segment", action="store_true",
+                   help="Break every horizon down by market segment "
+                        "(requires --segments)")
+    p.add_argument("--segment", default=None, metavar="NAME",
+                   help="Restrict the whole run to one segment "
+                        "(requires --segments)")
     p.add_argument("--keep-intermediates", action="store_true")
     return p.parse_args()
 
@@ -214,6 +224,22 @@ def main() -> int:
     print(f"  Horizons: {', '.join(_fmt_horizon(w, args.bucket_minutes) for w in args.windows)}")
     print("=" * 78)
 
+    # ── Segment map ──────────────────────────────────────────────────────
+    segment_map: dict[int, str] = {}
+    if args.segments:
+        segment_map = load_segment_map(args.segments)
+        print(f"  Segments: {args.segments}  ({len(segment_map):,} markets)")
+        if args.segment and args.segment not in SEGMENTS:
+            print(f"ERROR: unknown segment '{args.segment}'. "
+                  f"Known: {', '.join(SEGMENTS)}")
+            return 1
+        if args.segment:
+            print(f"  Filter  : only `{args.segment}`")
+    elif args.by_segment or args.segment:
+        print("ERROR: --by-segment / --segment need --segments PATH "
+              "(build it with classify_markets.py).")
+        return 1
+
     tmp = Path("_sweep_tmp")
     tmp.mkdir(exist_ok=True)
 
@@ -241,6 +267,7 @@ def main() -> int:
     print(f"\n[3/3] Labeling for {len(args.windows)} horizons (single pass) …")
     accs = {w: Accumulator() for w in args.windows}
     band_accs = {w: {b[0]: Accumulator() for b in _BANDS} for w in args.windows}
+    seg_accs = {w: {sg: Accumulator() for sg in SEGMENTS} for w in args.windows}
     label_cfgs = {
         w: type(cfg.label)(**{**cfg.label.__dict__, "forward_window_buckets": w})
         for w in args.windows
@@ -248,8 +275,21 @@ def main() -> int:
 
     pf = pq.ParquetFile(path)
     n_rg = pf.metadata.num_row_groups
+    skipped_markets = 0
     for rg in range(n_rg):
         market_df = pl.from_arrow(pf.read_row_group(rg))
+
+        # One row group is exactly one market, so the segment is a single
+        # dict lookup — no join needed.
+        market_segment = "other"
+        if segment_map:
+            mid = market_df["market_id"][0] if market_df.height else None
+            market_segment = segment_map.get(int(mid), "other") if mid is not None else "other"
+            if args.segment and market_segment != args.segment:
+                skipped_markets += 1
+                del market_df
+                continue
+
         for w in args.windows:
             labeled = add_labels(market_df, label_cfgs[w])
             valid = labeled.filter(
@@ -278,6 +318,8 @@ def main() -> int:
             c = np.asarray(cost.round_trip_cost(price), dtype=np.float64)
 
             accs[w].add(ret, c)
+            if args.by_segment:
+                seg_accs[w][market_segment].add(ret, c)
             if args.by_band:
                 for name, lo, hi in _BANDS:
                     m = (price >= lo) & (price < hi)
@@ -290,6 +332,8 @@ def main() -> int:
         if (rg + 1) % 200 == 0 or (rg + 1) == n_rg:
             print(f"    {rg + 1}/{n_rg} markets", flush=True)
     del pf
+    if args.segment and skipped_markets:
+        print(f"    {skipped_markets:,} markets skipped (other segments)")
 
     # ── Report ───────────────────────────────────────────────────────────
     print("\n" + "=" * 78)
@@ -336,6 +380,30 @@ def main() -> int:
             print("  with perfect foresight. At this horizon the problem is not the")
             print("  model — it is the holding period. Try longer windows before")
             print("  touching features or the label definition.")
+
+    if args.by_segment:
+        print(f"\n{'=' * 78}")
+        print("  BY MARKET SEGMENT")
+        print("=" * 78)
+        for sg in SEGMENTS:
+            if not any(seg_accs[w][sg].n for w in args.windows):
+                continue
+            print(f"\n  --- {sg} ---")
+            print(f"  {'Horizon':>9} {'Labeled':>12} {'MedianRet':>12}"
+                  f" {'MedianCost':>11} {'Ret>Cost':>10} {'MaxROI*':>9}")
+            print("  " + "-" * 66)
+            for w in args.windows:
+                a = seg_accs[w][sg]
+                if a.n == 0:
+                    continue
+                med, _p90, medcost = a.quantiles()
+                print(f"  {_fmt_horizon(w, args.bucket_minutes):>9} {a.n:>12,} "
+                      f"{med:>11.3%} {medcost:>10.2%} "
+                      f"{a.share_over_cost:>9.2%} {a.max_roi:>+8.2%}")
+        print("\n  Unterscheiden sich `Ret>Cost` und `MedianCost` zwischen den")
+        print("  Segmenten deutlich, lohnt eine Trennung. Sind sie aehnlich, ist")
+        print("  `segment` als kategoriales Feature in EINEM Modell der")
+        print("  guenstigere Weg — getrennte Modelle bekommen weniger Daten.")
 
     if args.by_band:
         print(f"\n{'=' * 78}")
