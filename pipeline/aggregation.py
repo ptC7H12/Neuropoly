@@ -2,6 +2,10 @@
 Trade aggregation into fixed-size time buckets per market.
 Produces bucketed trade statistics (OHLC-style + volume metrics).
 
+All price columns are P(YES): pipeline/data_loader normalises NO-side
+trade prices to their YES equivalent before aggregation, so open/close/
+high/low/mean/vwap describe the market, not the YES/NO trade mix.
+
 MEMORY OPTIMIZED:
 - No .collect()
 - Writes directly to Parquet via sink_parquet
