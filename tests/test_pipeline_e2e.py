@@ -91,7 +91,13 @@ def generate_synthetic_markets(n_markets: int = 5) -> pl.DataFrame:
 
 def test_full_pipeline():
     """Run the entire pipeline on synthetic data."""
+    try:
+        _run_full_pipeline()
+    finally:
+        _cleanup()
 
+
+def _run_full_pipeline():
     print("=" * 60)
     print("  E2E TEST: Synthetic Data Pipeline")
     print("=" * 60)
@@ -214,8 +220,21 @@ def test_full_pipeline():
 
     print("\n  ALL ASSERTIONS PASSED")
     print("=" * 60)
-    return True
+
+
+def _cleanup() -> None:
+    """Remove the intermediate Parquet files this test writes."""
+    for name in (
+        "bucketed.parquet",
+        "test_filled.parquet",
+        "test_filled_gaps.parquet",
+        "test_filled_final.parquet",
+    ):
+        Path(name).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-    test_full_pipeline()
+    try:
+        test_full_pipeline()
+    finally:
+        _cleanup()
