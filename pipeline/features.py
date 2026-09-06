@@ -8,6 +8,11 @@ from pathlib import Path
 
 import polars as pl
 import pyarrow.parquet as pq
+
+from pipeline.rowgroups import (
+    iter_market_row_groups,
+    write_market_table,
+)
 from datetime import datetime
 
 from config import FeatureConfig
@@ -46,7 +51,7 @@ def build_features(
     df = _add_market_features(df, markets)
 
     # 4. Cross / relative features
-    df = _add_cross_features(df)
+    df = _add_cross_features(df, cfg)
 
     # 5. Time features
     if cfg.time_features:
@@ -60,17 +65,28 @@ def build_features_streaming(
     markets: pl.DataFrame,
     cfg: FeatureConfig,
     output_path: str = "features.parquet",
+    batch_markets: int = 100,
 ) -> str:
     """
-    Build features one market at a time from a gap-filled Parquet file.
+    Build features from a gap-filled Parquet file, `batch_markets` markets at
+    a time.
 
     *filled_path* must contain exactly one row group per market — this is
     guaranteed by the gap_handler streaming pipeline (fill_buckets →
     detect_consecutive_gaps → apply_gap_exclusions all write with PyArrow,
-    one market per write_table call).
+    one market per write_table call).  The same invariant is preserved on
+    output, because add_labels_streaming relies on it.
 
-    Writes the feature matrix to *output_path* via a streaming PyArrow
-    writer — peak RAM = one market's rows.  Returns output_path.
+    Why batch: every feature here is already market-aware via .over(
+    "market_id"), so a batch produces exactly the same numbers as one market
+    at a time — but a single-market call spends ~17 ms of Polars per-call
+    overhead on a frame of a few dozen rows.  At 3 200 markets that was 76 s
+    of the 130 s preprocessing chain.  Batching amortises it.
+
+    RAM cost: peak is `batch_markets` markets instead of one.  Lower it if a
+    chunk is memory-tight; batch_markets=1 restores the old behaviour.
+
+    Returns output_path.
     """
 
     output_path = str(Path(output_path))
@@ -81,28 +97,34 @@ def build_features_streaming(
     pf = pq.ParquetFile(filled_path)
     n_rg = pf.metadata.num_row_groups
     writer = None
+    batch_markets = max(1, batch_markets)
 
-    for rg_idx in range(n_rg):
-        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+    for batch_start in range(0, n_rg, batch_markets):
+        group_ids = list(range(batch_start, min(batch_start + batch_markets, n_rg)))
+        batch_df = pl.from_arrow(pf.read_row_groups(group_ids))
 
-        featured = build_features(market_df, markets, cfg)
-        del market_df
+        featured = build_features(batch_df, markets, cfg)
+        del batch_df
 
-        arrow_tbl = featured.to_arrow()
-        if writer is None:
-            writer = pq.ParquetWriter(
-                output_path,
-                schema=arrow_tbl.schema,
-                compression="SNAPPY",
-                version="2.6",
-            )
-        writer.write_table(arrow_tbl)
+        # One row group per market on the way out — add_labels_streaming
+        # reads this file back on that assumption.
+        for part in featured.partition_by("market_id", maintain_order=True):
+            arrow_tbl = part.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    output_path,
+                    schema=arrow_tbl.schema,
+                    compression="SNAPPY",
+                    version="2.6",
+                )
+            write_market_table(writer, arrow_tbl)
+            del arrow_tbl, part
 
-        del featured, arrow_tbl
+        del featured
         gc.collect()
 
-        if (rg_idx + 1) % 100 == 0 or (rg_idx + 1) == n_rg:
-            print(f"  build_features: {rg_idx + 1}/{n_rg} markets", flush=True)
+        done = min(batch_start + batch_markets, n_rg)
+        print(f"  build_features: {done}/{n_rg} markets", flush=True)
 
     if writer:
         writer.close()
@@ -267,7 +289,7 @@ def _add_market_features(df: pl.DataFrame, markets: pl.DataFrame) -> pl.DataFram
     return df
 
 
-def _add_cross_features(df: pl.DataFrame) -> pl.DataFrame:
+def _add_cross_features(df: pl.DataFrame, cfg: FeatureConfig) -> pl.DataFrame:
     """Cross features: relationships between trade and market data."""
 
     # Entry price vs market price
@@ -284,10 +306,27 @@ def _add_cross_features(df: pl.DataFrame) -> pl.DataFrame:
             .alias("trade_size_vs_liquidity"),
         )
 
-    # Volume concentration: bucket volume / market total volume
-    if "volume" in df.columns:
+    # Volume concentration: this bucket's volume as a share of the volume
+    # traded in the trailing window.
+    #
+    # Two denominators were wrong before:
+    #   * `volume` from the markets table — the market's total LIFETIME
+    #     volume as of the CSV export.  For a bucket in 2020 that is a value
+    #     from the future, and being constant per market it also works as a
+    #     market-identity feature.
+    #   * a cumulative sum since the market's first bucket — causal, but not
+    #     chunk-invariant: train_chunked.py rebuilds features per 90-day
+    #     chunk, so the sum restarted at zero every chunk while run_pipeline
+    #     accumulated over the full history.  Same feature name, values
+    #     differing by ~11x on identical buckets.
+    #
+    # A trailing window is causal AND identical in both paths, because
+    # train_chunked reads --context-buckets of history before each chunk.
+    _win = max(cfg.rolling_windows) if cfg.rolling_windows else 1
+    _vol_sum = f"volume_sum{_win}"
+    if _vol_sum in df.columns:
         df = df.with_columns(
-            (pl.col("total_usd") / pl.col("volume"))
+            (pl.col("total_usd") / pl.col(_vol_sum))
             .fill_nan(None)
             .alias("volume_concentration"),
         )
@@ -369,8 +408,18 @@ def get_feature_columns(df) -> list[str]:
         "win",
         "future_return",
         "future_price",
+        "trade_return",
+        "trade_return_opp",
+        "entry_token_price",
+        "entry_token_price_opp",
         "question",
         "close_time",
+        # Snapshot columns from the markets table: their value is the state
+        # at export time, not at bucket time, so using them directly is
+        # look-ahead.  They stay in the frame because derived features are
+        # built from them, but they are not fed to the model.
+        "volume",
+        "liquidity",
     }
 
     # Schema objects (returned by collect_schema()) expose .names()
@@ -387,3 +436,52 @@ def _entropy(p: float) -> float:
     if p is None or p <= 0 or p >= 1:
         return 0.0
     return -(p * math.log2(p) + (1 - p) * math.log2(1 - p))
+
+
+def report_degenerate_features(
+    labeled_path: str,
+    feature_cols: list[str],
+    max_listed: int = 10,
+) -> dict[str, list[str]]:
+    """
+    Find features that carry no information: all-null, or a single value.
+
+    A model cannot split on these, so they are dead weight — and an all-null
+    column usually means the source data never had that field (markets.csv
+    has no yes_price / no_price / liquidity, for instance, so
+    convert_to_parquet writes them as null).  Worth knowing before reading a
+    feature-importance table.
+    """
+    import polars as pl
+
+    lf = pl.scan_parquet(labeled_path)
+    present = [c for c in feature_cols if c in lf.collect_schema().names()]
+    if not present:
+        return {"all_null": [], "constant": []}
+
+    stats = lf.select(
+        [pl.col(c).null_count().alias(f"{c}__nulls") for c in present]
+        + [pl.col(c).n_unique().alias(f"{c}__uniq") for c in present]
+        + [pl.len().alias("__n")]
+    ).collect()
+
+    n = int(stats["__n"][0])
+    all_null, constant = [], []
+    for c in present:
+        if int(stats[f"{c}__nulls"][0]) == n:
+            all_null.append(c)
+        elif int(stats[f"{c}__uniq"][0]) <= 1:
+            constant.append(c)
+
+    if all_null or constant:
+        print("\n  Degenerate features (no information for the model):")
+        if all_null:
+            shown = ", ".join(all_null[:max_listed])
+            more = f" (+{len(all_null) - max_listed} more)" if len(all_null) > max_listed else ""
+            print(f"    all null ({len(all_null)}): {shown}{more}")
+        if constant:
+            shown = ", ".join(constant[:max_listed])
+            more = f" (+{len(constant) - max_listed} more)" if len(constant) > max_listed else ""
+            print(f"    constant ({len(constant)}): {shown}{more}")
+
+    return {"all_null": all_null, "constant": constant}

@@ -34,7 +34,7 @@ import argparse
 import gc
 import sys
 import time
-from datetime import timedelta
+from datetime import timedelta, timezone
 from pathlib import Path
 
 import lightgbm as lgb
@@ -93,6 +93,19 @@ def _load_markets(args: argparse.Namespace, cfg: PipelineConfig) -> pl.DataFrame
     return markets_df
 
 
+def _to_utc_us(dt) -> int:
+    """
+    Microseconds since epoch for a bucket_time value.
+
+    bucket_time is stored tz-naive but means UTC, so a naive value has to be
+    pinned to UTC explicitly — datetime.timestamp() would read it as local
+    time and silently shift the chunk boundary by the machine's UTC offset.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1_000_000)
+
+
 def _time_bounds(bucketed_path: str) -> tuple[pl.Datetime, pl.Datetime]:
     """Return (min_time, max_time) from the bucketed Parquet without loading it all."""
     lf = pl.scan_parquet(bucketed_path)
@@ -126,11 +139,11 @@ def _process_chunk(
     markets_df: pl.DataFrame,
     cfg: PipelineConfig,
     chunk_start_actual,   # exclude context rows before this timestamp
-) -> tuple[np.ndarray, np.ndarray, list[str]] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]] | None:
     """
     Run gap handling, features, and labeling on one chunk.
-    Returns (X, y, feature_names) for trainable rows in [chunk_start_actual, end].
-    Returns None if no valid rows.
+    Returns (X, y, trade_returns, entry_prices, feature_names) for trainable
+    rows in [chunk_start_actual, end].  Returns None if no valid rows.
 
     Memory strategy: gap handling writes streaming Parquet (one row-group
     per market).  Then a **single** pass reads each row-group, computes
@@ -155,19 +168,21 @@ def _process_chunk(
     # ── Single streaming pass: features → labels → extract per market ──
     import pyarrow.parquet as pq
 
+    from pipeline.rowgroups import iter_market_row_groups
+
     pf = pq.ParquetFile(filled_path)
     n_rg = pf.metadata.num_row_groups
 
     X_parts: list[np.ndarray] = []
     y_parts: list[np.ndarray] = []
+    ret_parts: list[np.ndarray] = []
+    price_parts: list[np.ndarray] = []
     feature_cols: list[str] | None = None
     total_rows = 0
     total_labeled = 0
     total_wins = 0
 
-    for rg_idx in range(n_rg):
-        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
-
+    for rg_idx, market_df in iter_market_row_groups(pf):
         # Features (single market — fast, small)
         featured = build_features(market_df, markets_df, cfg.features)
         del market_df
@@ -200,6 +215,12 @@ def _process_chunk(
                 trainable.select(feature_cols).to_numpy().astype(np.float32)
             )
             y_parts.append(trainable["win"].to_numpy().astype(np.float32))
+            ret_parts.append(
+                trainable["trade_return"].to_numpy().astype(np.float64)
+            )
+            price_parts.append(
+                trainable["entry_token_price"].to_numpy().astype(np.float64)
+            )
         del trainable
 
         if (rg_idx + 1) % 500 == 0 or (rg_idx + 1) == n_rg:
@@ -223,10 +244,12 @@ def _process_chunk(
 
     X = np.concatenate(X_parts)
     y = np.concatenate(y_parts)
-    del X_parts, y_parts
+    ret = np.concatenate(ret_parts)
+    price = np.concatenate(price_parts)
+    del X_parts, y_parts, ret_parts, price_parts
     gc.collect()
 
-    return X, y, feature_cols
+    return X, y, ret, price, feature_cols
 
 
 # ── LightGBM helpers ───────────────────────────────────────────────────────────
@@ -321,6 +344,23 @@ def main():
     print(f"  Chunk size: {args.chunk_days} days")
     print(f"  Context:    {args.context_buckets} buckets at each boundary")
 
+    # Every rolling feature at a chunk boundary is computed from the context
+    # rows alone.  Too little context and those rows are silently wrong —
+    # and the chunked run stops matching what run_pipeline.py produces.
+    longest_window = max(
+        max(cfg.features.rolling_windows, default=1),
+        max(cfg.features.lag_buckets, default=1),
+    )
+    if args.context_buckets < longest_window:
+        print(
+            f"\n  WARNING: --context-buckets {args.context_buckets} is below the "
+            f"longest feature window ({longest_window}).\n"
+            f"           Rolling/lag features at every chunk boundary will be "
+            f"wrong, and the\n"
+            f"           result will not match run_pipeline.py. Use "
+            f"--context-buckets {longest_window} or more.\n"
+        )
+
     # ── Chunk loop ────────────────────────────────────────────────
     print("\n[3] Incremental training …\n")
     params = _lgbm_params(args)
@@ -340,14 +380,16 @@ def main():
 
         # Start of the read window: include context before the chunk
         # so lag/rolling features at the chunk boundary are correctly computed.
+        # bucket_time is tz-NAIVE UTC.  datetime.timestamp() on a naive value
+        # interprets it as LOCAL time, which shifts the context window by the
+        # machine's UTC offset (in UTC-5 that wipes out the whole 5 h of
+        # context).  Pin the timezone before converting.
         t_read_start_us = max(
-            int(t_chunk_start.timestamp() * 1_000_000) - context_us,
-            int(t_min.timestamp() * 1_000_000),
+            _to_utc_us(t_chunk_start) - context_us,
+            _to_utc_us(t_min),
         )
-        # Convert back to a compatible type for Polars filter
-        t_read_start = pl.Series([t_read_start_us]).cast(
-            pl.Datetime("us", t_chunk_start.time_zone if hasattr(t_chunk_start, "time_zone") else None)
-        )[0]
+        # Back to a tz-naive Polars datetime, matching the bucket_time column
+        t_read_start = pl.Series([t_read_start_us]).cast(pl.Datetime("us"))[0]
 
         print(
             f"  Chunk {chunk_num:3d}: {t_chunk_start}  →  {t_chunk_end}",
@@ -375,7 +417,8 @@ def main():
             t_chunk_start = t_chunk_end + timedelta(minutes=cfg.bucket.bucket_minutes)
             continue
 
-        X, y, feature_names = result
+        X, y, _ret, _price, feature_names = result
+        del _ret, _price  # only needed for the final backtest
         print(f"    X shape: {X.shape} | positives: {int(y.sum()):,}")
 
         booster = _train_chunk(
@@ -416,7 +459,7 @@ def main():
         if result is None:
             print("  No testable rows.")
         else:
-            X_test, y_test, _ = result
+            X_test, y_test, ret_test, price_test, _ = result
             y_pred = predict(booster, X_test)
             del X_test
             gc.collect()
@@ -427,6 +470,9 @@ def main():
             )
             bt = backtest(
                 y_test, y_pred,
+                trade_returns=ret_test,
+                entry_prices=price_test,
+                cost=cfg.backtest.cost,
                 entry_threshold=cfg.backtest.entry_threshold,
                 fee_rate=cfg.backtest.fee_rate,
                 max_position_usd=cfg.backtest.max_position_usd,

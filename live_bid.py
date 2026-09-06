@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 live_bid.py — Live bid validation using a trained model.txt
 
@@ -5,15 +6,20 @@ Usage:
     python live_bid.py --token-id <TOKEN_ID> [--model model.txt] [--threshold 0.6]
 
 What it does:
-    1. Fetches recent trades from Polymarket CLOB API (last ~4 hours)
-    2. Fetches market metadata from Polymarket Gamma API
-    3. Aggregates trades into 5-min buckets (same as training pipeline)
-    4. Computes the same features the model was trained on
-    5. Predicts P(win) for the most recent complete bucket
-    6. Outputs BID or NO BID
+    1. Resolves the token to its market via the Polymarket Gamma API
+    2. Fetches recent trades for that MARKET (both tokens) from the public
+       data-api, or from the SQLite DB written by collect_trades.py
+    3. Buckets, gap-fills and builds features with the SAME pipeline code
+       that produced the training data (pipeline/live_features.py)
+    4. Predicts P(win) for the most recent COMPLETED bucket
+    5. Outputs BID or NO BID
 
-The token-id is the 256-bit token ID from markets.csv (token1 = YES, token2 = NO).
-Find it in markets.csv or on the Polymarket website URL / API.
+The token-id is the 256-bit token ID from markets.csv (token1 = YES, token2 =
+NO).  Find it in markets.csv or on the Polymarket website URL / API.
+
+Feature parity with training matters: pass the same --bucket-minutes and
+--low-memory you trained with, otherwise the features will not line up and
+the model is scoring something else.
 
 Example:
     python live_bid.py \
@@ -28,474 +34,92 @@ Exit codes:
 """
 
 import argparse
-import math
-import sys
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-
 import sqlite3
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
-import numpy as np
-import polars as pl
 import lightgbm as lgb
+import polars as pl
 
-# ---------------------------------------------------------------------------
-# Polymarket API endpoints
-# ---------------------------------------------------------------------------
-CLOB_API = "https://clob.polymarket.com"
-GAMMA_API = "https://gamma-api.polymarket.com"
+sys.path.insert(0, str(Path(__file__).parent))
 
-# Bucket size (must match training)
-BUCKET_MINUTES = 5
-WHALE_THRESHOLD_USD = 1000.0
+from config import PipelineConfig
+from pipeline.live_features import (
+    UNAVAILABLE_LIVE_FEATURES,
+    align_to_model,
+    bucket_age,
+    build_live_features,
+    explain_missing,
+    history_window,
+    is_stale,
+)
+from pipeline.polymarket_api import (
+    MarketInfo,
+    PolymarketAPIError,
+    fetch_market,
+    fetch_trades,
+    normalize_trades,
+)
 
-# How many past buckets we need for the longest rolling window (48 buckets)
-MIN_HISTORY_BUCKETS = 60  # 60 × 5min = 5 hours, safe margin
-
-# Lag / rolling config (must match config.py FeatureConfig defaults)
-LAG_BUCKETS = [1, 2, 3, 6, 12]
-ROLLING_WINDOWS = [6, 12, 24, 48]
-
-
-# ---------------------------------------------------------------------------
-# API helpers
-# ---------------------------------------------------------------------------
-
-def _get(url: str, params: dict | None = None) -> dict | list:
-    """Simple GET with error handling. Requires `requests`."""
-    try:
-        import requests
-    except ImportError:
-        print("ERROR: 'requests' is not installed. Run: pip install requests")
-        sys.exit(2)
-
-    resp = requests.get(url, params=params, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def fetch_trades(token_id: str, limit: int = 1000) -> list[dict]:
-    """
-    Fetch recent trades for a token from the CLOB API.
-
-    Returns a list of dicts with keys:
-        timestamp, price, size (in tokens), side
-    """
-    data = _get(f"{CLOB_API}/trades", params={
-        "token_id": token_id,
-        "limit": limit,
-    })
-
-    # CLOB returns {"data": [...], "next_cursor": ...} or just a list
-    if isinstance(data, dict):
-        trades = data.get("data", [])
-    else:
-        trades = data
-
-    return trades
+_TRADE_SCHEMA = {
+    "timestamp": pl.Datetime("us"),
+    "price": pl.Float64,
+    "usd_amount": pl.Float64,
+    "token_amount": pl.Float64,
+    "is_yes": pl.Int8,
+}
 
 
 def fetch_trades_from_db(
     db_path: str,
-    token_id: str,
+    condition_id: str,
     since_unix: int,
 ) -> pl.DataFrame:
     """
-    Read recent trades from the SQLite database written by collect_trades.py.
+    Read recent trades for a market from the collect_trades.py database.
 
-    Returns a normalised Polars DataFrame (same schema as parse_trades).
+    `price_yes` is used, so the frame carries P(YES) exactly like the batch
+    pipeline does after data_loader normalisation.
     """
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    rows = conn.execute(
-        """SELECT timestamp, price, usd_amount, token_amount, is_yes
-           FROM trades
-           WHERE token_id = ? AND timestamp >= ?
-           ORDER BY timestamp ASC""",
-        (token_id, since_unix),
-    ).fetchall()
-    conn.close()
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+        if "price_yes" not in cols or "condition_id" not in cols:
+            raise RuntimeError(
+                f"'{db_path}' uses the old per-token schema, whose is_yes "
+                f"column is always 1. Delete it and re-collect with the "
+                f"current collect_trades.py."
+            )
+        rows = conn.execute(
+            """SELECT timestamp, price_yes, usd_amount, token_amount, is_yes
+               FROM trades
+               WHERE condition_id = ? AND timestamp >= ?
+               ORDER BY timestamp ASC""",
+            (condition_id, since_unix),
+        ).fetchall()
+    finally:
+        conn.close()
 
     if not rows:
-        return pl.DataFrame(schema={
-            "timestamp": pl.Datetime("us"),
-            "price": pl.Float64,
-            "usd_amount": pl.Float64,
-            "token_amount": pl.Float64,
-            "is_yes": pl.Boolean,
-        })
+        return pl.DataFrame(schema=_TRADE_SCHEMA)
 
-    df = pl.DataFrame(
+    return pl.DataFrame(
         {
-            "timestamp": [r[0] for r in rows],
-            "price": [r[1] for r in rows],
-            "usd_amount": [r[2] for r in rows],
-            "token_amount": [r[3] for r in rows],
-            "is_yes": [bool(r[4]) for r in rows],
-        }
-    ).with_columns(
-        pl.from_epoch(pl.col("timestamp"), time_unit="s")
-        .cast(pl.Datetime("us"))
-        .alias("timestamp")
+            "timestamp": [
+                datetime.fromtimestamp(r[0], tz=timezone.utc).replace(tzinfo=None)
+                for r in rows
+            ],
+            "price": [float(r[1]) for r in rows],
+            "usd_amount": [float(r[2]) for r in rows],
+            "token_amount": [float(r[3]) for r in rows],
+            "is_yes": [int(r[4]) for r in rows],
+        },
+        schema=_TRADE_SCHEMA,
     )
 
-    return df
 
-
-def fetch_market_info(token_id: str) -> dict:
-    """
-    Fetch market metadata from Gamma API by clob_token_id.
-
-    Returns a dict with market fields (volume, close_time, etc.)
-    or an empty dict if not found.
-    """
-    try:
-        data = _get(f"{GAMMA_API}/markets", params={
-            "clob_token_ids": token_id,
-        })
-        if isinstance(data, list) and data:
-            return data[0]
-        if isinstance(data, dict):
-            markets = data.get("markets", data.get("data", []))
-            if markets:
-                return markets[0]
-    except Exception as e:
-        print(f"  Warning: could not fetch market metadata: {e}")
-    return {}
-
-
-# ---------------------------------------------------------------------------
-# Trade parsing & aggregation
-# ---------------------------------------------------------------------------
-
-def parse_trades(raw_trades: list[dict], token_id: str) -> pl.DataFrame:
-    """
-    Convert raw CLOB API trade dicts into a normalised Polars DataFrame.
-
-    CLOB trade fields (typical):
-        type, token_id, outcome, price, size, trader_side,
-        timestamp (ISO string or Unix), transaction_hash, ...
-
-    We produce:
-        timestamp (Datetime[us]), price (f64), usd_amount (f64),
-        token_amount (f64), is_yes (bool)
-    """
-    rows = []
-    for t in raw_trades:
-        # Timestamp: may be ISO string or Unix int
-        ts_raw = t.get("timestamp") or t.get("created_at") or t.get("time")
-        if ts_raw is None:
-            continue
-
-        if isinstance(ts_raw, (int, float)):
-            ts = datetime.fromtimestamp(float(ts_raw), tz=timezone.utc)
-        else:
-            try:
-                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
-            except ValueError:
-                continue
-
-        price_raw = t.get("price")
-        size_raw = t.get("size") or t.get("amount")
-        if price_raw is None or size_raw is None:
-            continue
-
-        price = float(price_raw)
-        token_amount = float(size_raw)
-        usd_amount = price * token_amount
-
-        # Determine YES/NO from outcome field or token_id match
-        outcome = str(t.get("outcome", "")).upper()
-        if outcome in ("YES", "1"):
-            is_yes = True
-        elif outcome in ("NO", "0"):
-            is_yes = False
-        else:
-            # Fall back: check if this trade's token_id matches our token_id
-            is_yes = str(t.get("token_id", "")) == str(token_id)
-
-        rows.append({
-            "timestamp": ts.replace(tzinfo=None),  # naive UTC
-            "price": price,
-            "usd_amount": usd_amount,
-            "token_amount": token_amount,
-            "is_yes": is_yes,
-        })
-
-    if not rows:
-        return pl.DataFrame(schema={
-            "timestamp": pl.Datetime("us"),
-            "price": pl.Float64,
-            "usd_amount": pl.Float64,
-            "token_amount": pl.Float64,
-            "is_yes": pl.Boolean,
-        })
-
-    df = pl.DataFrame(rows).with_columns(
-        pl.col("timestamp").cast(pl.Datetime("us"))
-    )
-    return df.sort("timestamp")
-
-
-def aggregate_to_buckets(trades: pl.DataFrame) -> pl.DataFrame:
-    """
-    Aggregate trades into 5-minute buckets.
-    Mirrors pipeline/aggregation.py exactly.
-    """
-    bucket_dur = f"{BUCKET_MINUTES}m"
-
-    bucketed = (
-        trades
-        .with_columns(
-            pl.col("timestamp").dt.truncate(bucket_dur).alias("bucket_time")
-        )
-        .group_by("bucket_time")
-        .agg([
-            pl.len().alias("trade_count"),
-            pl.col("usd_amount").sum().alias("total_usd"),
-            pl.col("token_amount").sum().alias("total_tokens"),
-            pl.col("price").first().alias("open_price"),
-            pl.col("price").last().alias("close_price"),
-            pl.col("price").max().alias("high_price"),
-            pl.col("price").min().alias("low_price"),
-            pl.col("price").mean().alias("mean_price"),
-            (pl.col("price") * pl.col("usd_amount")).sum().alias("_price_x_usd"),
-            pl.col("is_yes").mean().alias("yes_ratio"),
-            (pl.col("usd_amount") > WHALE_THRESHOLD_USD).sum().alias("whale_count"),
-            pl.col("usd_amount")
-                .filter(pl.col("usd_amount") > WHALE_THRESHOLD_USD)
-                .sum()
-                .alias("whale_usd"),
-        ])
-        .sort("bucket_time")
-        .with_columns(
-            (pl.col("_price_x_usd") / pl.col("total_usd"))
-                .fill_nan(None)
-                .alias("vwap"),
-        )
-        .drop("_price_x_usd")
-        .with_columns(
-            (pl.col("close_price") - pl.col("open_price")).alias("momentum"),
-            pl.col("whale_usd").fill_null(0.0),
-            pl.col("whale_count").fill_null(0),
-        )
-    )
-
-    return bucketed
-
-
-# ---------------------------------------------------------------------------
-# Feature engineering (mirrors pipeline/features.py)
-# ---------------------------------------------------------------------------
-
-def _add_lag_features(df: pl.DataFrame) -> pl.DataFrame:
-    lag_cols = ["mean_price", "total_usd", "trade_count", "momentum", "yes_ratio"]
-    exprs = []
-    for col in lag_cols:
-        if col not in df.columns:
-            continue
-        for lag in LAG_BUCKETS:
-            exprs.append(pl.col(col).shift(lag).alias(f"{col}_lag{lag}"))
-
-    if exprs:
-        df = df.with_columns(exprs)
-
-    for lag in LAG_BUCKETS:
-        lag_col = f"mean_price_lag{lag}"
-        if lag_col in df.columns:
-            df = df.with_columns([
-                (pl.col("mean_price") - pl.col(lag_col))
-                    .alias(f"price_change_lag{lag}"),
-                ((pl.col("mean_price") - pl.col(lag_col)) / pl.col(lag_col))
-                    .fill_nan(None)
-                    .alias(f"price_return_lag{lag}"),
-            ])
-    return df
-
-
-def _add_rolling_features(df: pl.DataFrame) -> pl.DataFrame:
-    for window in ROLLING_WINDOWS:
-        df = df.with_columns([
-            pl.col("mean_price").rolling_mean(window_size=window)
-                .alias(f"price_ma{window}"),
-            pl.col("mean_price").rolling_std(window_size=window)
-                .alias(f"price_std{window}"),
-            pl.col("total_usd").rolling_sum(window_size=window)
-                .alias(f"volume_sum{window}"),
-            pl.col("trade_count").rolling_mean(window_size=window)
-                .alias(f"trade_count_ma{window}"),
-            pl.col("momentum").rolling_mean(window_size=window)
-                .alias(f"momentum_ma{window}"),
-        ])
-
-    for window in ROLLING_WINDOWS:
-        ma_col = f"price_ma{window}"
-        df = df.with_columns(
-            ((pl.col("mean_price") - pl.col(ma_col)) / pl.col(ma_col))
-                .fill_nan(None)
-                .alias(f"price_vs_ma{window}")
-        )
-    return df
-
-
-def _add_market_features(df: pl.DataFrame, market: dict, now: datetime) -> pl.DataFrame:
-    """Add scalar market-level features from Gamma API data."""
-
-    yes_price = _safe_float(market.get("outcomePrices", [None])[0]
-                            if market.get("outcomePrices") else market.get("yes_price"))
-    no_price = _safe_float(market.get("outcomePrices", [None, None])[1]
-                           if market.get("outcomePrices") else market.get("no_price"))
-    volume = _safe_float(market.get("volume") or market.get("volumeNum"))
-    liquidity = _safe_float(market.get("liquidity") or market.get("liquidityNum"))
-    end_date_str = market.get("endDate") or market.get("end_date_iso") or market.get("close_time")
-
-    exprs = []
-
-    if yes_price is not None:
-        exprs.append(pl.lit(yes_price).alias("yes_price"))
-    if no_price is not None:
-        exprs.append(pl.lit(no_price).alias("no_price"))
-    if volume is not None:
-        exprs.append(pl.lit(volume).alias("volume"))
-    if liquidity is not None:
-        exprs.append(pl.lit(liquidity).alias("liquidity"))
-
-    if exprs:
-        df = df.with_columns(exprs)
-
-    # Derived: spread & entropy
-    if "yes_price" in df.columns and "no_price" in df.columns:
-        df = df.with_columns(
-            (pl.col("yes_price") - pl.col("no_price")).abs().alias("market_spread"),
-        )
-        p = pl.col("yes_price").clip(1e-9, 1.0 - 1e-9)
-        df = df.with_columns(
-            (-(p * p.log(base=2) + (1 - p) * (1 - p).log(base=2)))
-                .alias("market_entropy")
-        )
-
-    # Days to close
-    if end_date_str:
-        try:
-            close_dt = datetime.fromisoformat(
-                str(end_date_str).replace("Z", "+00:00")
-            ).replace(tzinfo=None)
-            days_to_close = (close_dt - now).total_seconds() / 86400
-            df = df.with_columns(pl.lit(days_to_close).alias("days_to_close"))
-        except Exception:
-            pass
-
-    return df
-
-
-def _add_cross_features(df: pl.DataFrame) -> pl.DataFrame:
-    if "yes_price" in df.columns:
-        df = df.with_columns(
-            (pl.col("mean_price") - pl.col("yes_price")).alias("entry_vs_market")
-        )
-
-    if "liquidity" in df.columns:
-        df = df.with_columns(
-            (pl.col("total_usd") / pl.col("liquidity"))
-                .fill_nan(None)
-                .alias("trade_size_vs_liquidity")
-        )
-
-    if "volume" in df.columns:
-        df = df.with_columns(
-            (pl.col("total_usd") / pl.col("volume"))
-                .fill_nan(None)
-                .alias("volume_concentration")
-        )
-
-    if "whale_count" in df.columns:
-        df = df.with_columns(
-            (pl.col("whale_count").cast(pl.Float64) / pl.col("trade_count").cast(pl.Float64))
-                .fill_nan(0.0)
-                .alias("whale_ratio")
-        )
-        df = df.with_columns(
-            (pl.col("whale_ratio") * pl.col("momentum")).alias("whale_momentum")
-        )
-
-    if "days_to_close" in df.columns:
-        df = df.with_columns(
-            (pl.col("momentum") / (pl.col("days_to_close") + 1))
-                .fill_nan(None)
-                .alias("momentum_per_day")
-        )
-
-    return df
-
-
-def _add_time_features(df: pl.DataFrame) -> pl.DataFrame:
-    df = df.with_columns([
-        pl.col("bucket_time").dt.hour().alias("hour"),
-        pl.col("bucket_time").dt.weekday().alias("day_of_week"),
-    ])
-    df = df.with_columns([
-        (pl.col("hour").cast(pl.Float64) * 2 * math.pi / 24).sin().alias("hour_sin"),
-        (pl.col("hour").cast(pl.Float64) * 2 * math.pi / 24).cos().alias("hour_cos"),
-        (pl.col("day_of_week").cast(pl.Float64) * 2 * math.pi / 7).sin().alias("dow_sin"),
-        (pl.col("day_of_week").cast(pl.Float64) * 2 * math.pi / 7).cos().alias("dow_cos"),
-        (pl.col("day_of_week") >= 5).cast(pl.Int8).alias("is_weekend"),
-    ])
-    return df
-
-
-def build_features(bucketed: pl.DataFrame, market: dict, now: datetime) -> pl.DataFrame:
-    """Build the full feature matrix from bucketed data + market metadata."""
-    df = bucketed.clone()
-    df = _add_lag_features(df)
-    df = _add_rolling_features(df)
-    df = _add_market_features(df, market, now)
-    df = _add_cross_features(df)
-    df = _add_time_features(df)
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _safe_float(v) -> Optional[float]:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-EXCLUDE_COLS = {
-    "bucket_time", "market_id", "is_empty_bucket", "in_gap", "in_long_gap",
-    "exclude_from_training", "win", "future_return", "future_price",
-    "question", "close_time",
-}
-
-
-def get_feature_row(df: pl.DataFrame, booster: lgb.Booster) -> np.ndarray:
-    """
-    Extract the last row of df, aligned to the model's expected feature names.
-
-    Missing features are filled with NaN (LightGBM handles them natively).
-    """
-    model_features = booster.feature_name()
-    last_row = df.tail(1)
-
-    row = {}
-    for feat in model_features:
-        if feat in last_row.columns:
-            val = last_row[feat][0]
-            row[feat] = float(val) if val is not None else float("nan")
-        else:
-            row[feat] = float("nan")
-
-    return np.array([list(row.values())], dtype=np.float32)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main() -> None:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Live bid validation using a trained Polymarket model.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -514,19 +138,38 @@ def main() -> None:
         help="P(win) threshold to trigger a BID (default: 0.6).",
     )
     parser.add_argument(
-        "--history-buckets", type=int, default=MIN_HISTORY_BUCKETS,
-        help="How many past 5-min buckets to use (default: 60 = 5 hours).",
+        "--history-buckets", type=int, default=60,
+        help="How many past buckets to use (default: 60 = 5 h at 5 min).",
+    )
+    parser.add_argument(
+        "--bucket-minutes", type=int, default=5,
+        help="Bucket size — MUST match what the model was trained with.",
+    )
+    parser.add_argument(
+        "--low-memory", action="store_true",
+        help="Reduced feature set — set this if you trained with --low-memory.",
     )
     parser.add_argument(
         "--db", default=None,
         help="Path to SQLite DB from collect_trades.py. "
-             "If given, reads history from DB instead of the live API.",
+             "If given, reads history from the DB instead of the live API.",
     )
     parser.add_argument(
         "--verbose", action="store_true",
         help="Print detailed feature values.",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    cfg = PipelineConfig()
+    cfg.bucket.bucket_minutes = args.bucket_minutes
+    if args.low_memory:
+        cfg.features.lag_buckets = [1, 3, 6]
+        cfg.features.rolling_windows = [6, 12]
+        cfg.features.cross_market_features = False
 
     now = datetime.now(tz=timezone.utc).replace(tzinfo=None)
 
@@ -536,6 +179,7 @@ def main() -> None:
     print(f"  Token ID : ...{args.token_id[-12:]}")
     print(f"  Model    : {args.model}")
     print(f"  Threshold: P(win) >= {args.threshold:.0%}")
+    print(f"  Buckets  : {args.bucket_minutes} min")
     print(f"  Time     : {now.strftime('%Y-%m-%d %H:%M UTC')}")
     print(f"{'='*55}\n")
 
@@ -546,92 +190,123 @@ def main() -> None:
     except Exception as e:
         print(f"ERROR: Could not load model from '{args.model}': {e}")
         sys.exit(2)
-    print(f"  Loaded. Features: {len(booster.feature_name())}")
+    model_features = booster.feature_name()
+    print(f"  Loaded. Features: {len(model_features)}")
 
-    # 2. Fetch market metadata
-    print("[2/5] Fetching market metadata...")
-    market = fetch_market_info(args.token_id)
-    if market:
-        q = market.get("question", market.get("title", "unknown"))[:60]
-        print(f"  Market : {q}")
-        end = market.get("endDate") or market.get("end_date_iso", "unknown")
-        print(f"  Closes : {end}")
-    else:
-        print("  Warning: no market metadata found — some features will be NaN")
+    # 2. Resolve the market
+    print("[2/5] Resolving market...")
+    try:
+        market: MarketInfo | None = fetch_market(args.token_id)
+    except PolymarketAPIError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(2)
+    if market is None or not market.condition_id:
+        print("ERROR: No market found for that token ID.")
+        sys.exit(2)
+    print(f"  Market : {market.question[:60]}")
+    print(f"  Closes : {market.end_date}")
+    side_label = {1: "YES", 0: "NO"}.get(market.side_of(args.token_id), "?")
+    print(f"  Your token is the {side_label} side")
 
-    # 3. Load recent trades (from SQLite DB or live API)
-    cutoff = now - timedelta(minutes=args.history_buckets * BUCKET_MINUTES)
+    # 3. Load recent trades (from SQLite DB or the public data-api)
+    lookback = history_window(cfg, args.history_buckets)
+    cutoff = now - lookback
     cutoff_unix = int(cutoff.replace(tzinfo=timezone.utc).timestamp())
 
     if args.db:
         print(f"[3/5] Reading trades from DB ({args.db})...")
-        trades = fetch_trades_from_db(args.db, args.token_id, cutoff_unix)
-        print(f"  Trades in window: {len(trades)}")
-        if trades.is_empty():
-            print("ERROR: No trades in DB for this token / time window.")
-            print("       Start collect_trades.py first and wait for data to accumulate.")
+        try:
+            trades = fetch_trades_from_db(args.db, market.condition_id, cutoff_unix)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}")
             sys.exit(2)
     else:
-        print(f"[3/5] Fetching live trades from CLOB API "
-              f"(last ~{args.history_buckets * BUCKET_MINUTES} min)...")
-        raw_trades = fetch_trades(args.token_id, limit=min(args.history_buckets * 20, 2000))
-        print(f"  API returned {len(raw_trades)} raw trades")
-
-        trades = parse_trades(raw_trades, args.token_id)
-
-        if trades.is_empty():
-            print("ERROR: No trades found. Check the token ID and try again.")
+        print(f"[3/5] Fetching trades from data-api "
+              f"(last {lookback.total_seconds()/3600:.1f} h)...")
+        try:
+            raw_trades = fetch_trades(
+                market.condition_id, since_unix=cutoff_unix, max_trades=5000
+            )
+        except PolymarketAPIError as exc:
+            print(f"ERROR: {exc}")
             sys.exit(2)
+        print(f"  API returned {len(raw_trades)} trades in window")
+        trades = normalize_trades(raw_trades, market)
 
-        trades = trades.filter(pl.col("timestamp") >= cutoff)
-        print(f"  Trades in window: {len(trades)}")
+    print(f"  Usable trades: {trades.height}")
+    if trades.is_empty():
+        print("ERROR: No trades in the lookback window. Market may be inactive.")
+        print("       Use --db with collect_trades.py for low-activity markets.")
+        sys.exit(2)
 
-        if len(trades) == 0:
-            print("ERROR: No trades in the lookback window. Market may be inactive.")
-            print("       Use --db with collect_trades.py for low-activity markets.")
-            sys.exit(2)
+    # 4. Bucket + gap-fill + features, via the training code path
+    print("[4/5] Building features (training pipeline)...")
+    featured = build_live_features(trades, market, cfg, now=now)
+    if featured.is_empty():
+        print("ERROR: No completed bucket available yet — wait for the current "
+              "bucket to close, or widen --history-buckets.")
+        sys.exit(2)
 
-    # 4. Aggregate & build features
-    print("[4/5] Aggregating and building features...")
-    bucketed = aggregate_to_buckets(trades)
-    n_buckets = len(bucketed)
-    print(f"  Buckets: {n_buckets} × {BUCKET_MINUTES} min")
+    n_buckets = featured.height
+    last_bucket_time = featured["bucket_time"][-1]
+    print(f"  Buckets: {n_buckets} × {cfg.bucket.bucket_minutes} min "
+          f"(gap-filled, current bucket excluded)")
+    print(f"  Scoring bucket: {last_bucket_time}")
 
-    if n_buckets < max(LAG_BUCKETS):
-        print(f"WARNING: Only {n_buckets} buckets — lag features will be NaN "
-              f"(need >{max(LAG_BUCKETS)} for full accuracy).")
+    age = bucket_age(last_bucket_time, now, cfg.bucket.bucket_minutes)
+    stale = is_stale(age, cfg.bucket.bucket_minutes)
+    if stale:
+        mins = age.total_seconds() / 60
+        print(f"  !! STALE: that bucket closed {mins:.0f} min ago. The market "
+              f"has not traded since,")
+        print(f"     so this is not a live signal — every training row is a "
+              f"bucket that had just closed.")
 
-    featured = build_features(bucketed, market, now)
+    longest = max(cfg.features.rolling_windows, default=1)
+    if n_buckets < longest:
+        print(f"  WARNING: only {n_buckets} buckets — rolling windows up to "
+              f"{longest} will be NaN. Collect more history for full accuracy.")
 
     # 5. Predict
     print("[5/5] Predicting...")
-    X = get_feature_row(featured, booster)
+    X, missing = align_to_model(featured, model_features)
+    known, unexpected = explain_missing(missing)
+    for feat in known:
+        print(f"  NOTE: '{feat}' is NaN — {UNAVAILABLE_LIVE_FEATURES[feat]}")
+    if unexpected:
+        print(f"  WARNING: {len(unexpected)} model feature(s) not produced live "
+              f"(scored as NaN): {unexpected[:5]}"
+              f"{'...' if len(unexpected) > 5 else ''}")
+        print(f"           Check that --bucket-minutes / --low-memory match "
+              f"what the model was trained with.")
     p_win = float(booster.predict(X)[0])
 
-    # --- Determine WHICH SIDE the model's P(win) refers to ---
+    # --- Which side does P(win) refer to? ---
     #
     # During training (labeling.py):
     #   yes_ratio > 0.5  →  bucket is predominantly YES buys
-    #                        win=1 means price went UP   → good for YES holders
-    #   yes_ratio <= 0.5 →  bucket is predominantly NO  buys
-    #                        win=1 means price went DOWN → good for NO holders
+    #                        win=1 means P(YES) went UP   → good for YES holders
+    #   yes_ratio <= 0.5 →  bucket is predominantly NO buys
+    #                        win=1 means P(YES) went DOWN → good for NO holders
     #
-    # So P(win) = probability that the DOMINANT side in the last bucket wins.
-    # We must show the user which side that is.
-
+    # So P(win) = probability that the DOMINANT side of that bucket wins.
     last_bucket = featured.tail(1)
     yes_ratio_val = last_bucket["yes_ratio"][0]
     if yes_ratio_val is None:
-        yes_ratio_val = 0.5  # unknown → treat as neutral
+        yes_ratio_val = 0.5
 
     dominant_side = "YES" if yes_ratio_val > 0.5 else "NO"
     bid = p_win >= args.threshold
 
     print(f"\n{'='*55}")
-    print(f"  Current bucket yes_ratio : {yes_ratio_val:.2f}")
+    _age_note = (f"  ({age.total_seconds()/60:.0f} min old — STALE)"
+                 if stale else "")
+    print(f"  Scored bucket            : {last_bucket_time}{_age_note}")
+    print(f"  Bucket yes_ratio         : {yes_ratio_val:.2f}")
+    print(f"  Mean price (P(YES))      : {last_bucket['mean_price'][0]:.4f}")
     print(f"  Dominant side            : {dominant_side} "
           f"({'price must rise' if dominant_side == 'YES' else 'price must fall'} to win)")
-    print(f"  P(win) for {dominant_side:<3s}          : {p_win:.4f}  ({p_win:.1%})")
+    print(f"  P(win) for {dominant_side + ' ':<14s}: {p_win:.4f}  ({p_win:.1%})")
     print(f"  Threshold                : {args.threshold:.1%}")
     if bid:
         print(f"  Decision  : *** BID {dominant_side} ***")
@@ -640,13 +315,11 @@ def main() -> None:
     print(f"{'='*55}\n")
 
     if args.verbose:
-        model_features = booster.feature_name()
         last = featured.tail(1)
-        print("  Feature values (last bucket):")
+        print("  Feature values (scored bucket):")
         for feat in model_features:
             if feat in last.columns:
-                v = last[feat][0]
-                print(f"    {feat:<35s} = {v}")
+                print(f"    {feat:<35s} = {last[feat][0]}")
             else:
                 print(f"    {feat:<35s} = NaN (not computed)")
         print()

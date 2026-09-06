@@ -68,6 +68,46 @@ def generate_synthetic_trades(
     return df.sort("timestamp").lazy()
 
 
+def write_raw_trades_parquet(
+    path,
+    n_markets: int = 5,
+    trades_per_market: int = 5000,
+    seed: int = 42,
+):
+    """
+    Write trades in the RAW on-disk schema, i.e. what convert_to_parquet
+    produces and pipeline/data_loader consumes.
+
+    The difference to generate_synthetic_trades() matters: on disk, `price`
+    is the price of the token that was actually traded, so token2 rows carry
+    the NO price (1 - p).  A fixture that puts YES prices on both sides never
+    exercises the normalisation in data_loader — and, once normalisation is
+    applied to it, produces a bimodal price series and absurd returns.
+    """
+    df = generate_synthetic_trades(
+        n_markets=n_markets, trades_per_market=trades_per_market, seed=seed
+    ).collect()
+
+    df = df.with_columns(
+        pl.when(pl.col("is_yes") == 1)
+        .then(pl.lit("token1"))
+        .otherwise(pl.lit("token2"))
+        .alias("side"),
+        # Undo the YES convention: a NO fill is quoted at 1 - P(YES)
+        pl.when(pl.col("is_yes") == 1)
+        .then(pl.col("price"))
+        .otherwise(1.0 - pl.col("price"))
+        .alias("price"),
+        pl.when(pl.col("is_buy") == 1)
+        .then(pl.lit("BUY"))
+        .otherwise(pl.lit("SELL"))
+        .alias("direction"),
+    ).drop(["is_yes", "is_buy"])
+
+    df.write_parquet(path)
+    return path
+
+
 def generate_synthetic_markets(n_markets: int = 5) -> pl.DataFrame:
     """Generate synthetic market snapshot data."""
 
@@ -91,7 +131,13 @@ def generate_synthetic_markets(n_markets: int = 5) -> pl.DataFrame:
 
 def test_full_pipeline():
     """Run the entire pipeline on synthetic data."""
+    try:
+        _run_full_pipeline()
+    finally:
+        _cleanup()
 
+
+def _run_full_pipeline():
     print("=" * 60)
     print("  E2E TEST: Synthetic Data Pipeline")
     print("=" * 60)
@@ -107,9 +153,18 @@ def test_full_pipeline():
     cfg.monitor.log_file = None
     cfg.monitor.log_interval = 20
 
-    # Generate data
+    # Generate data in the raw on-disk schema and load it through the real
+    # loader, so price normalisation is part of what this test covers.
     print("\n[1] Generating synthetic data...")
-    trades_lf = generate_synthetic_trades(n_markets=5, trades_per_market=5000)
+    raw_path = Path("_e2e_trades.parquet")
+    write_raw_trades_parquet(raw_path, n_markets=5, trades_per_market=5000)
+
+    from config import DataConfig
+    from pipeline.data_loader import load_trades
+
+    trades_lf = load_trades(
+        DataConfig(trades_path=str(raw_path), trades_format="parquet")
+    )
     markets_df = generate_synthetic_markets(n_markets=5)
     print(f"  Trades: {trades_lf.collect().height} rows")
     print(f"  Markets: {markets_df.height} rows")
@@ -151,9 +206,29 @@ def test_full_pipeline():
     assert stats["labeled"] > 0, "Should have labeled rows"
     assert 0.2 < stats["win_rate"] < 0.8, f"Win rate {stats['win_rate']} seems extreme"
 
+    # Both ends of a labelled trade must be a price someone actually traded
+    # at.  The entry side was always checked; the exit side was not, and on
+    # sparse data that was the majority of all labels.
+    _w = cfg.label.forward_window_buckets
+    _check = labeled.with_columns(
+        pl.col("is_empty_bucket").shift(-_w).over("market_id")
+        .fill_null(True).alias("_exit_empty"),
+        pl.col("exclude_from_training").shift(-_w).over("market_id")
+        .fill_null(True).alias("_exit_excluded"),
+    ).filter(pl.col("win").is_not_null())
+    _phantom = _check.filter(
+        pl.col("_exit_empty") | pl.col("_exit_excluded")
+    ).height
+    assert _phantom == 0, (
+        f"{_phantom} labelled rows exit into a bucket that never traded"
+    )
+    print(f"  no label exits into an empty bucket ({_check.height} checked)")
+
     # Split
     print("\n[6] Walk-forward split...")
-    split = walk_forward_split(labeled, feature_cols, cfg.split, cfg.label)
+    split = walk_forward_split(
+        labeled, feature_cols, cfg.split, cfg.label, cfg.bucket.bucket_minutes
+    )
     print_split_info(split)
     assert split.train_X.shape[0] > 0, "Train set empty"
     assert split.val_X.shape[0] > 0, "Val set empty"
@@ -174,13 +249,60 @@ def test_full_pipeline():
     from pipeline.evaluation import evaluate, backtest, print_evaluation
 
     metrics = evaluate(split.test_y, y_pred)
-    bt = backtest(split.test_y, y_pred)
+    bt = backtest(
+        split.test_y, y_pred,
+        trade_returns=split.test_ret,
+        entry_threshold=cfg.backtest.entry_threshold,
+        fee_rate=cfg.backtest.fee_rate,
+        max_position_usd=cfg.backtest.max_position_usd,
+        kelly_sizing=cfg.backtest.kelly_sizing,
+        kelly_cap=cfg.backtest.kelly_cap,
+        initial_bankroll=cfg.backtest.initial_bankroll,
+    )
     print_evaluation(metrics, bt)
+
+    # The backtest must use realised price moves, never the even-money
+    # placeholder — otherwise ROI is off by orders of magnitude.
+    assert bt.payoff_model == "return", "Backtest fell back to the binary payoff"
+    assert split.test_ret is not None, "Split did not carry trade returns"
+
+    # No label may leak across a split boundary: the gap between the last
+    # training row and the first validation row must cover the label horizon.
+    from pipeline.splitter import purge_minutes
+    from datetime import timedelta
+    need = timedelta(minutes=purge_minutes(cfg.split, cfg.label, cfg.bucket.bucket_minutes))
+    assert split.val_start - split.train_end >= need, (
+        f"train→val gap {split.val_start - split.train_end} < required {need}"
+    )
+    assert split.test_start - split.val_end >= need, (
+        f"val→test gap {split.test_start - split.val_end} < required {need}"
+    )
+
+    # Realised returns must be economically sane: a 30-minute move on a
+    # prediction market is a few percent, not a few hundred percent.
+    finite = split.test_ret[np.isfinite(split.test_ret)]
+    assert np.abs(finite).mean() < 0.5, (
+        f"mean |trade_return| = {np.abs(finite).mean():.3f} — implausible"
+    )
 
     print("\n  ALL ASSERTIONS PASSED")
     print("=" * 60)
-    return True
+
+
+def _cleanup() -> None:
+    """Remove the intermediate Parquet files this test writes."""
+    for name in (
+        "_e2e_trades.parquet",
+        "bucketed.parquet",
+        "test_filled.parquet",
+        "test_filled_gaps.parquet",
+        "test_filled_final.parquet",
+    ):
+        Path(name).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-    test_full_pipeline()
+    try:
+        test_full_pipeline()
+    finally:
+        _cleanup()

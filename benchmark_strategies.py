@@ -62,8 +62,13 @@ from pipeline.gap_handler import (
     detect_consecutive_gaps,
     apply_gap_exclusions,
 )
-from pipeline.features import build_features_streaming, get_feature_columns
+from pipeline.features import (
+    build_features_streaming,
+    get_feature_columns,
+    report_degenerate_features,
+)
 from pipeline.labeling import add_labels_streaming, label_stats_lazy
+from pipeline.segments import SEGMENTS, load_segment_map, segment_series
 from pipeline.splitter import walk_forward_split, print_split_info
 from pipeline.evaluation import evaluate, backtest, EvalMetrics, BacktestResult
 from pipeline.results_logger import append_to_log, print_log_history
@@ -94,6 +99,11 @@ def parse_args() -> argparse.Namespace:
                    help="Random seed for 'random' baseline strategy")
     p.add_argument("--keep-intermediates", action="store_true",
                    help="Keep temp Parquet files after run")
+    p.add_argument("--segments", default=None, metavar="PATH",
+                   help="Segment map from classify_markets.py")
+    p.add_argument("--segment", default=None, metavar="NAME",
+                   help="Restrict evaluation to one segment "
+                        f"({'/'.join(SEGMENTS)}); requires --segments")
     p.add_argument("--log-file", default="results_log.jsonl", metavar="PATH",
                    help="JSONL file to append results to for historical tracking "
                         "(default: results_log.jsonl). Pass '' to disable.")
@@ -123,14 +133,18 @@ class StrategyResult:
 def _run_eval(
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    trade_returns: np.ndarray,
+    entry_prices: np.ndarray,
     cfg: PipelineConfig,
 ) -> tuple[EvalMetrics, BacktestResult]:
-    """Evaluate and run backtest on a (y_true, y_pred) pair."""
+    """Evaluate and run backtest on one strategy's arrays."""
 
     # Remove NaN / inf
     valid = np.isfinite(y_pred) & np.isfinite(y_true)
     y_true = y_true[valid]
     y_pred = np.clip(y_pred[valid], 1e-7, 1.0 - 1e-7)
+    trade_returns = trade_returns[valid]
+    entry_prices = entry_prices[valid]
 
     if len(y_true) < 10:
         raise ValueError("Too few valid rows for evaluation")
@@ -141,6 +155,9 @@ def _run_eval(
     bt = backtest(
         y_true,
         y_pred,
+        trade_returns=trade_returns,
+        entry_prices=entry_prices,
+        cost=cfg.backtest.cost,
         entry_threshold=cfg.backtest.entry_threshold,
         fee_rate=cfg.backtest.fee_rate,
         max_position_usd=cfg.backtest.max_position_usd,
@@ -417,6 +434,58 @@ def strat_contrarian(
     )
 
 
+# -- 8./9. Favourite and Longshot -------------------------------------------
+#
+# These answer the question "is the CHEAP side systematically mispriced?" —
+# the well-posed version of "bet against the market".  contrarian/reversion
+# answer something else: they bet against the bucket's trade FLOW.
+#
+# Both pick a side per ROW rather than per strategy, so they return the
+# optional 5th element `take_dominant`.
+
+def _side_by_price(df: pl.DataFrame, want_favourite: bool) -> tuple:
+    """
+    Buy the expensive side (favourite) or the cheap side (longshot).
+
+    `entry_token_price` is the price of the dominant side, `_opp` the
+    complementary one; they sum to 1.  Whether the favourite happens to be
+    the dominant side varies row by row, hence the per-row choice.
+    """
+    px_dom = _col(df, "entry_token_price")
+    px_opp = _col(df, "entry_token_price_opp")
+    if px_dom is None or px_opp is None:
+        return np.array([]), np.array([]), 0.0, "entry_token_price missing", None
+
+    win = df["win"].to_numpy().astype(np.float32)
+
+    dom_is_favourite = px_dom >= px_opp
+    take_dom = dom_is_favourite if want_favourite else ~dom_is_favourite
+
+    # `win` scores the dominant side, so taking the other side flips it
+    y_true = np.where(take_dom, win, 1.0 - win).astype(np.float32)
+
+    # Confidence = how lopsided the market is.  A 0.95/0.05 market is a
+    # stronger instance of "favourite" than a 0.51/0.49 one.
+    chosen_price = np.where(take_dom, px_dom, px_opp)
+    extremity = np.abs(chosen_price - 0.5) * 2.0
+    score = (0.5 + np.clip(extremity, 0.0, 1.0) * 0.5).astype(np.float32)
+
+    label = "favourite" if want_favourite else "longshot"
+    desc = (f"Always buy the {'expensive' if want_favourite else 'cheap'} "
+            f"side ({label})")
+    return y_true, score, 1.0, desc, take_dom
+
+
+def strat_favourite(df: pl.DataFrame) -> tuple:
+    """Buy the side the market considers likely. Tests longshot overpricing."""
+    return _side_by_price(df, want_favourite=True)
+
+
+def strat_longshot(df: pl.DataFrame) -> tuple:
+    """Buy the cheap side — the literal 'bet against the market' reading."""
+    return _side_by_price(df, want_favourite=False)
+
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -443,6 +512,9 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
         f"{'AUC':>8}"
         f"{'Brier':>7}"
         f"{'WinRate':>8}"
+        f"{'Profit%':>8}"
+        f"{'Ret/Trd':>9}"
+        f"{'Cost':>8}"
         f"{'ROI':>8}"
         f"{'Sharpe':>7}"
         f"{'Trades':>7}"
@@ -457,7 +529,8 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
             continue
         m  = r.metrics
         bt = r.bt
-        dir_tag = "follow" if r.bet_direction == "follow" else "AGAINST"
+        dir_tag = {"follow": "follow", "against": "AGAINST"}.get(
+            r.bet_direction, "mixed")
         print(
             f"  {r.name:<16}"
             f"{dir_tag:<8}"
@@ -465,18 +538,29 @@ def _print_comparison_table(results: list[StrategyResult], threshold: float) -> 
             f"{m.roc_auc:>7.4f}"
             f"{m.brier_score:>7.4f}"
             f"{bt.win_rate:>7.1%} "
+            f"{bt.profit_rate:>7.1%} "
+            f"{bt.mean_trade_return:>+9.3%}"
+            f"{bt.mean_cost:>8.2%}"
             f"{bt.roi:>+8.1%}"
-            f"{bt.sharpe_ratio:>7.2f}"
+            f"{bt.sharpe_ratio:>7.3f}"
             f"{bt.total_trades:>7}"
         )
 
     print(sep)
     print(
-        f"\n  Dir=follow  → strategy bets WITH the dominant bucket side   (win = original label)\n"
+        f"\n  Dir=mixed   → strategy picks the side per ROW (favourite / longshot)\n"
+        f"  Dir=follow  → strategy bets WITH the dominant bucket side   (win = original label)\n"
         f"  Dir=AGAINST → strategy bets AGAINST the dominant side        "
         f"(win = flipped label = crowd is wrong)\n"
         f"  Cover       → % of test rows where strategy fires a signal\n"
+        f"  WinRate     → % of trades where the price moved the right way\n"
+        f"  Profit%     → % of trades that made money AFTER the fee\n"
+        f"  Ret/Trd     → mean realised return per trade (before costs)\n"
+        f"  Cost        → mean round-trip cost per trade; scales with 1/price,\n"
+        f"                so it is far higher on extreme-priced markets\n"
         f"  AUC/Brier   → ML metrics on the strategy's own win criterion\n"
+        f"  ROI         → PnL / deployed capital — independent of bankroll size\n"
+        f"  Sharpe      → per trade, NOT annualised\n"
         f"  Trades      → trades executed in backtest (strategy-entry ≥ {threshold:.0%})"
     )
 
@@ -507,12 +591,18 @@ def _print_strategy_detail(r: StrategyResult, threshold: float) -> None:
     if bt.total_trades == 0:
         print(f"  No trades triggered — try lowering --entry-threshold")
     else:
-        print(f"  Trades   : {bt.total_trades}")
-        print(f"  Win rate : {bt.win_rate:.2%}")
-        print(f"  Total PnL: ${bt.total_pnl:,.2f}")
-        print(f"  ROI      : {bt.roi:+.2%}")
-        print(f"  Sharpe   : {bt.sharpe_ratio:.2f}")
-        print(f"  Max DD   : ${bt.max_drawdown:,.2f}  ({bt.max_drawdown_pct:.2%})")
+        print(f"  Trades     : {bt.total_trades}")
+        print(f"  Win rate   : {bt.win_rate:.2%}   (price moved the right way)")
+        print(f"  Profitable : {bt.profit_rate:.2%}   (after fee)")
+        print(f"  Mean return: {bt.mean_trade_return:+.4%} per trade")
+        print(f"  Mean cost  : {bt.mean_cost:.4%} per trade")
+        if bt.skipped_untradeable:
+            print(f"  Skipped    : {bt.skipped_untradeable} untradeable "
+                  f"(cost above position value)")
+        print(f"  Total PnL  : ${bt.total_pnl:,.2f}  on ${bt.total_staked:,.2f} staked")
+        print(f"  ROI        : {bt.roi:+.2%}   (on deployed capital)")
+        print(f"  Sharpe     : {bt.sharpe_ratio:.3f}  (per trade)")
+        print(f"  Max DD     : ${bt.max_drawdown:,.2f}  ({bt.max_drawdown_pct:.2%})")
 
     print(f"{'='*w}")
 
@@ -603,6 +693,10 @@ def main() -> None:
     )
     lstats = label_stats_lazy(labeled_path)
     print(f"  Labeled: {lstats['labeled']:,}  |  Win rate: {lstats['win_rate']:.3f}")
+    if lstats.get("mean_trade_return") is not None:
+        print(f"  Mean trade return: {lstats['mean_trade_return']:+.5f}")
+
+    report_degenerate_features(labeled_path, feature_cols)
 
     # ── Step 6: Walk-forward split ───────────────────────────────────────────
     print("\n[6/6] Walk-forward split...")
@@ -611,7 +705,9 @@ def main() -> None:
         .filter(pl.col("win").is_not_null())
         .collect()
     )
-    split = walk_forward_split(labeled, feature_cols, cfg.split, cfg.label)
+    split = walk_forward_split(
+        labeled, feature_cols, cfg.split, cfg.label, cfg.bucket.bucket_minutes
+    )
     del labeled
     gc.collect()
     print_split_info(split)
@@ -628,6 +724,32 @@ def main() -> None:
         .sort("bucket_time")
     )
     test_df = labeled_all.filter(pl.col("bucket_time") >= split.test_start)
+
+    # Optional segment filter — test_df comes from labeled_all and already
+    # carries market_id, so this is a plain membership test.
+    if args.segment:
+        if not args.segments:
+            print("ERROR: --segment needs --segments PATH "
+                  "(build it with classify_markets.py).")
+            sys.exit(1)
+        if args.segment not in SEGMENTS:
+            print(f"ERROR: unknown segment '{args.segment}'. "
+                  f"Known: {', '.join(SEGMENTS)}")
+            sys.exit(1)
+        seg_map = load_segment_map(args.segments)
+        before = test_df.height
+        # segment_of() defaults unmapped markets to "other", exactly as
+        # sweep_horizon does — filtering by membership in the map instead
+        # would silently drop them from `--segment other`.
+        seg_col = segment_series(test_df["market_id"].to_list(), seg_map)
+        test_df = test_df.filter(seg_col == args.segment)
+        n_markets_kept = test_df["market_id"].n_unique()
+        print(f"\n  Segment filter `{args.segment}`: "
+              f"{before:,} → {test_df.height:,} test rows "
+              f"({n_markets_kept:,} markets in that segment)")
+        if test_df.height == 0:
+            print("  No test rows left in that segment — nothing to benchmark.")
+            sys.exit(1)
     del labeled_all
     gc.collect()
 
@@ -649,6 +771,8 @@ def main() -> None:
         ("volume",      "follow",  lambda df: strat_volume(df, spike_x=3.0)),
         ("closing",     "follow",  lambda df: strat_closing(df, max_days=14.0)),
         ("contrarian",  "against", lambda df: strat_contrarian(df, yr_thr=0.65, price_thr=0.65)),
+        ("favourite",   "mixed",   lambda df: strat_favourite(df)),
+        ("longshot",    "mixed",   lambda df: strat_longshot(df)),
     ]
 
     results: list[StrategyResult] = []
@@ -657,7 +781,16 @@ def main() -> None:
 
     for name, direction, fn in STRATEGIES:
         try:
-            y_true, y_pred, coverage, description = fn(test_df)
+            result = fn(test_df)
+            # Strategies may return a 5th element `take_dominant`: a per-row
+            # choice of side.  favourite/longshot need it because whether the
+            # favourite IS the dominant side changes from row to row; the
+            # older strategies keep a fixed direction and return 4 elements.
+            if len(result) == 5:
+                y_true, y_pred, coverage, description, take_dominant = result
+            else:
+                y_true, y_pred, coverage, description = result
+                take_dominant = None
 
             if len(y_true) == 0:
                 results.append(StrategyResult(
@@ -667,7 +800,24 @@ def main() -> None:
                 ))
                 continue
 
-            metrics, bt = _run_eval(y_true, y_pred, cfg)
+            # A strategy that bets AGAINST the dominant side holds the
+            # complementary token, so it realises the opposite return.
+            ret_dom = test_df["trade_return"].to_numpy().astype(np.float64)
+            ret_opp = test_df["trade_return_opp"].to_numpy().astype(np.float64)
+            px_dom = test_df["entry_token_price"].to_numpy().astype(np.float64)
+            px_opp = test_df["entry_token_price_opp"].to_numpy().astype(np.float64)
+
+            if take_dominant is not None:
+                # Per-row side, same pairing rule as sweep_horizon.best_side:
+                # the return and the price must come from the SAME side.
+                returns = np.where(take_dominant, ret_dom, ret_opp)
+                prices = np.where(take_dominant, px_dom, px_opp)
+            elif direction == "follow":
+                returns, prices = ret_dom, px_dom
+            else:
+                returns, prices = ret_opp, px_opp
+
+            metrics, bt = _run_eval(y_true, y_pred, returns, prices, cfg)
             results.append(StrategyResult(
                 name=name, description=description,
                 bet_direction=direction,
@@ -729,6 +879,7 @@ def main() -> None:
             if not r.error and r.bt is not None:
                 _log_entry[f"{r.name}_auc"]    = round(r.metrics.roc_auc, 4)
                 _log_entry[f"{r.name}_roi"]    = round(r.bt.roi, 4)
+                _log_entry[f"{r.name}_ret"]    = round(r.bt.mean_trade_return, 6)
                 _log_entry[f"{r.name}_sharpe"] = round(r.bt.sharpe_ratio, 3)
                 _log_entry[f"{r.name}_trades"] = r.bt.total_trades
             else:

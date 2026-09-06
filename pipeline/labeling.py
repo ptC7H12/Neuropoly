@@ -6,6 +6,15 @@ Binary label:  win ∈ {0, 1}
 - NO side:  win=1 if future_price < entry_price - min_move
 
 Regression target: future_return = (future_price - entry_price) / entry_price
+
+Realised trade returns (used by the backtest — NOT features):
+- trade_return      = return of holding the DOMINANT side of the bucket
+                      for `forward_window_buckets` buckets
+- trade_return_opp  = return of holding the OPPOSITE side instead
+
+`win` only says whether the price moved the right way; it says nothing about
+*how far*.  A share bought at 0.50 that moves to 0.501 is a win, but it pays
+0.2 %, not 100 %.  The backtest therefore has to use trade_return, not `win`.
 """
 
 import gc
@@ -13,6 +22,11 @@ from pathlib import Path
 
 import polars as pl
 import pyarrow.parquet as pq
+
+from pipeline.rowgroups import (
+    iter_market_row_groups,
+    write_market_table,
+)
 
 from config import LabelConfig
 
@@ -27,8 +41,10 @@ def add_labels(
     Uses mean_price of the current bucket as entry price.
     Uses mean_price N buckets forward as future price.
 
-    Buckets marked `exclude_from_training` or `is_empty_bucket`
-    will NOT receive labels (set to null).
+    Buckets marked `exclude_from_training` or `is_empty_bucket` will NOT
+    receive labels (set to null) — and neither will buckets whose EXIT
+    bucket, `forward_window_buckets` ahead, carries either flag.  Both ends
+    of the trade have to be a price someone actually traded at.
     """
 
     # Compute future price: mean_price shifted backward by forward_window
@@ -82,30 +98,82 @@ def add_labels(
         .alias("win"),
     )
 
-    # Nullify labels for excluded or empty buckets
-    if "exclude_from_training" in df.columns:
-        df = df.with_columns(
-            pl.when(pl.col("exclude_from_training"))
-            .then(pl.lit(None))
-            .otherwise(pl.col("win"))
-            .alias("win"),
-            pl.when(pl.col("exclude_from_training"))
-            .then(pl.lit(None))
-            .otherwise(pl.col("future_return"))
-            .alias("future_return"),
-        )
+    # ── Realised trade returns ───────────────────────────────────────────
+    #
+    # Entry at mean_price of the current bucket, exit at mean_price of the
+    # bucket `forward_window_buckets` ahead.  A YES share costs `p`, a NO
+    # share costs `1 - p`, so the two sides have different denominators:
+    #
+    #   YES: buy at p,      sell at p'      → (p' - p) / p
+    #   NO : buy at (1-p),  sell at (1-p')  → (p - p') / (1 - p)
+    #
+    # trade_return     → betting WITH the dominant bucket side (what `win` scores)
+    # trade_return_opp → betting AGAINST it (the complementary token)
+    _entry = pl.col("mean_price").clip(1e-6, 1.0 - 1e-6)
+    _exit = pl.col("future_price")
+    _ret_yes = (_exit - _entry) / _entry
+    _ret_no = (_entry - _exit) / (1.0 - _entry)
+    _yes_dominant = pl.col("yes_ratio") > 0.5
 
-    # Nullify labels for empty buckets (no real trades → no real entry)
-    if "is_empty_bucket" in df.columns:
+    df = df.with_columns(
+        pl.when(_yes_dominant)
+        .then(_ret_yes)
+        .otherwise(_ret_no)
+        .fill_nan(None)
+        .alias("trade_return"),
+        pl.when(_yes_dominant)
+        .then(_ret_no)
+        .otherwise(_ret_yes)
+        .fill_nan(None)
+        .alias("trade_return_opp"),
+        # Price of the token actually held.  The backtest needs it because
+        # trading costs are quoted in absolute price units, so their share of
+        # a position scales with 1/price (see config.CostConfig).
+        pl.when(_yes_dominant)
+        .then(_entry)
+        .otherwise(1.0 - _entry)
+        .alias("entry_token_price"),
+        pl.when(_yes_dominant)
+        .then(1.0 - _entry)
+        .otherwise(_entry)
+        .alias("entry_token_price_opp"),
+    )
+
+    # Nullify targets for buckets where either END of the trade is fictional.
+    #
+    # Entry side: an empty bucket has no real trades, so mean_price is only a
+    # forward-filled carry-over — there is no price you could have entered at.
+    # An excluded bucket sits inside a known data gap.
+    #
+    # EXIT side, checked the same way `forward_window_buckets` ahead: the exit
+    # price comes from that bucket, so if it never traded, the position is
+    # closed at a price nobody quoted.  Forward-fill makes such an exit look
+    # like "no movement", which drags the measured return toward zero — on
+    # sparse data that silently dominates the label set.
+    _targets = [
+        "win", "future_return", "trade_return", "trade_return_opp",
+        "entry_token_price", "entry_token_price_opp",
+    ]
+    for flag in ("exclude_from_training", "is_empty_bucket"):
+        if flag not in df.columns:
+            continue
+        entry_bad = pl.col(flag)
+        # shift(-N) is null past the end of a market; future_price is null
+        # there too, so those rows are already unlabelled either way.
+        exit_bad = (
+            pl.col(flag)
+            .shift(-cfg.forward_window_buckets)
+            .over("market_id")
+            .fill_null(True)
+        )
         df = df.with_columns(
-            pl.when(pl.col("is_empty_bucket"))
-            .then(pl.lit(None))
-            .otherwise(pl.col("win"))
-            .alias("win"),
-            pl.when(pl.col("is_empty_bucket"))
-            .then(pl.lit(None))
-            .otherwise(pl.col("future_return"))
-            .alias("future_return"),
+            [
+                pl.when(entry_bad | exit_bad)
+                .then(pl.lit(None))
+                .otherwise(pl.col(col))
+                .alias(col)
+                for col in _targets
+            ]
         )
 
     # Cast win to Int8 (nullable)
@@ -140,6 +208,9 @@ def label_stats(df: pl.DataFrame) -> dict:
         "std_future_return": (
             labeled["future_return"].std() if "future_return" in labeled.columns else None
         ),
+        "mean_trade_return": (
+            labeled["trade_return"].mean() if "trade_return" in labeled.columns else None
+        ),
     }
 
 
@@ -147,11 +218,16 @@ def add_labels_streaming(
     features_path: str,
     cfg: LabelConfig,
     output_path: str = "labeled.parquet",
+    batch_markets: int = 100,
 ) -> str:
     """
-    Add win/future_return labels one market at a time from a features Parquet
-    file.  Peak RAM = one market's rows (same row-group-per-market invariant
-    guaranteed by build_features_streaming).
+    Add win / future_return / trade_return labels from a features Parquet
+    file, `batch_markets` markets at a time.
+
+    Every label expression is market-aware (shift(-N).over("market_id") or
+    row-wise), so a batch yields exactly the same values as one market at a
+    time while amortising Polars' per-call overhead.  Peak RAM is
+    `batch_markets` markets' rows; pass 1 to process strictly one at a time.
 
     Returns the output file path.
     """
@@ -161,24 +237,29 @@ def add_labels_streaming(
     pf = pq.ParquetFile(features_path)
     n_rg = pf.metadata.num_row_groups
     writer = None
+    batch_markets = max(1, batch_markets)
 
-    for rg_idx in range(n_rg):
-        market_df = pl.from_arrow(pf.read_row_group(rg_idx))
+    for batch_start in range(0, n_rg, batch_markets):
+        group_ids = list(range(batch_start, min(batch_start + batch_markets, n_rg)))
+        batch_df = pl.from_arrow(pf.read_row_groups(group_ids))
 
-        labeled_df = add_labels(market_df, cfg)
-        del market_df
+        labeled_df = add_labels(batch_df, cfg)
+        del batch_df
 
-        arrow_tbl = labeled_df.to_arrow()
-        if writer is None:
-            writer = pq.ParquetWriter(
-                output_path,
-                schema=arrow_tbl.schema,
-                compression="SNAPPY",
-                version="2.6",
-            )
-        writer.write_table(arrow_tbl)
+        # Preserve one row group per market
+        for part in labeled_df.partition_by("market_id", maintain_order=True):
+            arrow_tbl = part.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    output_path,
+                    schema=arrow_tbl.schema,
+                    compression="SNAPPY",
+                    version="2.6",
+                )
+            write_market_table(writer, arrow_tbl)
+            del arrow_tbl, part
 
-        del labeled_df, arrow_tbl
+        del labeled_df
         gc.collect()
 
     if writer:
@@ -210,6 +291,9 @@ def label_stats_lazy(labeled_path: str) -> dict:
             pl.col("future_return").mean().alias("mean_future_return"),
             pl.col("future_return").std().alias("std_future_return"),
         ]
+    has_trade_return = "trade_return" in schema_names
+    if has_trade_return:
+        agg_exprs.append(pl.col("trade_return").mean().alias("mean_trade_return"))
 
     row = lf.select(agg_exprs).collect()
 
@@ -229,5 +313,7 @@ def label_stats_lazy(labeled_path: str) -> dict:
     if has_future_return:
         result["mean_future_return"] = row["mean_future_return"][0]
         result["std_future_return"]  = row["std_future_return"][0]
+    if has_trade_return:
+        result["mean_trade_return"] = row["mean_trade_return"][0]
 
     return result

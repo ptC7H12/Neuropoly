@@ -5,10 +5,44 @@ CPU-only, RAM-effizient, verarbeitet 144 Mio+ Trades.
 
 ---
 
+## Wichtig: bestehende Artefakte neu erzeugen
+
+Zwei Aenderungen veraendern die Bedeutung der Daten selbst. Vorhandene
+`bucketed.parquet`-Dateien und jedes darauf trainierte `model.txt` sind
+damit ungueltig und muessen neu erzeugt werden:
+
+1. **Preise sind jetzt durchgaengig P(YES).** NO-seitige Trades werden beim
+   Laden auf `1 - price` umgerechnet (siehe *Preiskonvention* weiter unten).
+   `mean_price` bedeutet dadurch etwas anderes als vorher.
+2. **Feature-Set 93 → 91.** `volume` und `liquidity` sind raus (Snapshot-Werte
+   vom Export-Zeitpunkt, also Look-ahead), und `volume_concentration` teilt
+   jetzt durch das Volumen im laengsten Rolling-Fenster statt durch das
+   Lifetime-Volumen. Der Fenster-Nenner ist bewusst gewaehlt: er ist kausal
+   *und* liefert in `run_pipeline.py` und `train_chunked.py` denselben Wert,
+   weil die Kontext-Buckets eines Chunks ihn abdecken.
+
+Ausserdem sind die ROI-Zahlen aus frueheren Laeufen in `results_log.jsonl`
+nicht mit neuen vergleichbar: der Backtest rechnete mit einer
+Even-Money-Wette statt mit der tatsaechlichen Preisbewegung und lag damit um
+Groessenordnungen zu hoch. Am besten die Datei archivieren und neu anfangen.
+
+Ablauf nach dem Update:
+
+```bash
+rm -f bucketed.parquet model.txt trades.db
+mv results_log.jsonl results_log.old.jsonl 2>/dev/null || true
+# dann Phase 1 wie unten beschrieben neu durchlaufen
+```
+
+---
+
 ## Uebersicht
 
 ```
 markets.csv + orderFilled.csv
+        |
+        v
+[0] sweep_horizon.py            Traegt sich die Haltedauer? (vor allem anderen)
         |
         v
 [1] convert_to_parquet.py       CSV → Parquet (chunk-weise, < 1 GB RAM)
@@ -52,6 +86,124 @@ source venv/bin/activate
 ```bash
 pip install -r requirements.txt
 ```
+
+---
+
+## Phase 0 — Traegt sich die Haltedauer? (`sweep_horizon.py`)
+
+Bevor du ein Modell trainierst: pruefe, ob im gewaehlten Label-Fenster
+ueberhaupt genug Preisbewegung steckt, um die Handelskosten zu bezahlen.
+
+```bash
+python sweep_horizon.py \
+    --trades data/trades.parquet --markets data/markets.parquet \
+    --windows 3 6 12 24 48 96 288 --by-band
+```
+
+Ausgabe:
+
+```
+    Horizon      Labeled    MedianRet     p90Ret  MedianCost   Ret>Cost   MaxROI*
+  ----------------------------------------------------------------------------
+     15 min       46,574      0.121%    1.745%     10.01%     0.06%   +4.71%
+     30 min       46,558      0.870%    2.933%      9.94%     0.36%   +7.26%
+        1 h       46,520      1.315%    4.339%      9.91%     1.38%   +9.13%
+        2 h       46,443      1.934%    6.312%      9.83%     4.12%  +10.50%
+        4 h       46,292      2.843%    8.975%      9.73%    10.38%   +9.59%
+        8 h       45,984      4.031%   12.618%      9.72%    22.11%   +9.98%
+        1 d       44,808      6.894%   20.137%      9.58%    46.25%  +10.64%
+```
+
+| Spalte | Bedeutung |
+|---|---|
+| `MedianRet` | Rendite der **besseren** der beiden Seiten (YES oder NO) |
+| `MedianCost` | Round-Trip-Kosten genau dieser Seite |
+| `Ret>Cost` | Anteil der Buckets, in denen diese Rendite ihre Kosten schlaegt |
+| `MaxROI*` | ROI bei **perfekter Voraussicht** — nur diese Buckets handeln und immer die richtige Seite treffen |
+
+**`Ret>Cost` ist die Entscheidungszahl.** Sie ist eine Obergrenze: sie
+unterstellt, dass du fuer jeden Bucket die bessere Seite kennst. Liegt sie
+unter ~5 %, kann kein Modell profitabel werden — dann ist nicht das Modell
+das Problem, sondern die Haltedauer. Kein Grund, an Features oder am Label
+zu drehen; erst laengere Fenster probieren.
+
+Beide Seiten werden dabei getrennt gerechnet. Eine YES- und eine NO-Share
+desselben Marktes sind keine Spiegelbilder: bei P(YES) = 0.20 kostet die
+YES-Share 0.20 und die NO-Share 0.80. Ein Preisrutsch auf 0.19 ist deshalb
+−5,0 % auf der YES-Seite, aber +1,25 % auf der NO-Seite — bei 13 % gegen
+3,2 % Kosten.
+
+Mit `--by-band` kommt eine Aufschluesselung nach Tokenpreis dazu. Weil die
+Kosten mit `1/Preis` skalieren, kann ein Horizont in der liquiden Mitte
+funktionieren und an den Raendern hoffnungslos sein — oder umgekehrt.
+
+Das Ergebnis haengt stark an `--spread-abs` (Default 0.010, der gemessene
+Median). Mit 0.002 springt `Ret>Cost` bei 30 Minuten von 0,36 % auf 7,61 %.
+Setz den Wert auf das, was du in deinen Maerkten wirklich siehst.
+
+| Parameter | Default | Beschreibung |
+|---|---|---|
+| `--trades` / `--markets` | `data/*.parquet` | Datenpfade |
+| `--windows` | `3 6 12 24 48 96 288` | Horizonte in Buckets |
+| `--bucket-minutes` | `5` | Bucket-Groesse |
+| `--spread-abs` | `0.010` | Absoluter Spread (siehe `CostConfig`) |
+| `--fee-legs` | `2` | Als Taker ueberquerte Legs |
+| `--by-band` | — | Zusaetzlich nach Tokenpreis aufschluesseln |
+| `--keep-intermediates` | — | Zwischendateien behalten |
+
+Der Sweep laeuft Bucketing und Luecken-Behandlung **einmal** und danach je
+Horizont nur noch das Labeling — Features werden gar nicht gebaut, sie
+spielen fuer diese Frage keine Rolle.
+
+---
+
+### Segmente: Sport, Krypto, Politik trennen
+
+`markets.csv` hat kein Kategorie-Feld, und Polymarkets Gamma-API taggt nur
+noch **offene** Maerkte: von 100 geschlossenen hatte keiner einen brauchbaren
+Segment-Tag (nur den Platzhalter `All`), aktive dagegen zu 100 %. Ein
+historischer Datensatz besteht fast nur aus geschlossenen Maerkten.
+
+Deshalb wird aus dem `market_slug` klassifiziert — und gegen die API-Tags der
+noch aktiven Maerkte benotet:
+
+```bash
+python classify_markets.py --markets data/markets.parquet \
+    --out data/market_segments.parquet --validate
+```
+
+`--validate` gibt eine Konfusionsmatrix und Precision/Recall je Segment aus.
+Gemessen an 1.309 aktiven Maerkten:
+
+| Segment | Precision | Recall |
+|---|---|---|
+| sports | 100,0 % | 97,4 % |
+| crypto | 100,0 % | 72,5 % |
+| politics | 100,0 % | 84,0 % |
+
+Precision zaehlt hier mehr als Recall: was als `sports` markiert ist, soll
+auch Sport sein. Unklares landet absichtlich in `other` statt geraten zu
+werden — ein zu eifriger Filter wuerde sonst still auf den falschen Daten
+trainieren.
+
+Damit dann die Diagnose je Segment:
+
+```bash
+python sweep_horizon.py --trades data/trades.parquet \
+    --segments data/market_segments.parquet --windows 6 24 96 288 --by-segment
+
+# oder nur ein Segment
+python sweep_horizon.py ... --segments data/market_segments.parquet \
+    --segment sports --by-band
+```
+
+**So entscheidest du ueber getrennte Modelle:** unterscheiden sich `Ret>Cost`
+und `MedianCost` zwischen den Segmenten deutlich, lohnt die Trennung. Sind
+sie aehnlich, ist `segment` als kategoriales Feature in **einem** Modell der
+guenstigere Weg — LightGBM splittet selbst darauf, und jedes Teilmodell
+bekaeme sonst weniger Daten.
+
+`benchmark_strategies.py` nimmt dieselben Flags (`--segments`, `--segment`).
 
 ---
 
@@ -168,7 +320,15 @@ Ergebnis: `model.txt` (das trainierte LightGBM-Modell)
 ### Test mit synthetischen Daten (ohne eigene Daten)
 
 ```bash
-python tests/test_pipeline_e2e.py
+python tests/test_pipeline_e2e.py            # kompletter Durchlauf
+python tests/test_data_loader.py             # Preis-Normalisierung
+python tests/test_streaming_equivalence.py   # Batching == Einzelmarkt
+```
+
+Oder alle zusammen mit pytest:
+
+```bash
+pip install pytest && pytest tests/ -q
 ```
 
 ---
@@ -227,10 +387,18 @@ Erwartete Ausgabe:
 =======================================================
   ROC AUC  : 0.5873       <- die wichtige Zahl
   Brier    : 0.241
-  Win rate : 61.2%
-  ROI      : 14.3%
-  Sharpe   : 1.8
+  Win rate   : 61.2%      <- Preis lief in die richtige Richtung
+  Profitable : 18.4%      <- davon nach Kosten im Plus
+  Mean return: +0.412%    <- pro Trade, vor Kosten
+  Mean cost  : 9.8%       <- Spread + Gebuehr, skaliert mit 1/Preis
+  ROI        : -9.6%      <- auf eingesetztes Kapital
+  Sharpe     : 0.09       <- pro Trade, nicht annualisiert
 ```
+
+Die Groessenordnung ist Absicht: eine 30-Minuten-Bewegung auf einem
+Prediction Market liegt typisch bei ~1 %, nicht bei zweistelligen Prozenten.
+Frueher rechnete der Backtest mit einer Even-Money-Wette (+100 % / -100 %)
+und produzierte dadurch ROI-Zahlen, die um Groessenordnungen zu hoch waren.
 
 **Wie du die Zahlen liest:**
 
@@ -238,8 +406,76 @@ Erwartete Ausgabe:
 |---|---|---|---|
 | ROC AUC (Test) | Trennschaerfe | > 0.55 | Train >> Test = Overfitting |
 | Brier Score | Kalibrierung | < 0.23 | > 0.25 = schlechter als Muenzwurf |
-| ROI (Backtest) | Simulierter Gewinn | > 0% | Negativ = Modell taugt nicht |
-| Sharpe Ratio | Risikoadjustiert | > 1.0 | < 0 = inkonsistente Ergebnisse |
+| Win rate | Anteil Trades mit richtiger Preisrichtung | > 50% | — |
+| Profitable | Anteil Trades die **nach Kosten** Geld machten | > 50% | << Win rate = Bewegungen zu klein |
+| Mean return | Mittlere realisierte Rendite pro Trade | > Mean cost | < Mean cost = strukturell unprofitabel |
+| Mean cost | Mittlere Round-Trip-Kosten pro Trade | — | steigt stark bei billigen Tokens |
+| ROI (Backtest) | Gewinn / eingesetztes Kapital | > 0% | Negativ = Modell taugt nicht |
+| Sharpe (pro Trade) | Rendite / Streuung, **nicht** annualisiert | > 0.1 | < 0 = inkonsistente Ergebnisse |
+
+`ROI` ist die Rendite auf das **tatsaechlich eingesetzte Kapital**
+(`Summe PnL / Summe Einsaetze`) und haengt damit weder von `initial_bankroll`
+noch von der Zeilenreihenfolge ab — bei fester Positionsgroesse gilt exakt
+`ROI = Mean return - fee_rate`. Daneben steht `Bankroll growth`: das ist die
+Entwicklung der simulierten Bankroll und haengt sehr wohl von
+`initial_bankroll` und `max_position_usd` ab. Sie ist Kontext fuer die
+Equity-Kurve, **keine** Aussage ueber die Strategie. Reicht die Bankroll
+nicht fuer alle Trades, wird das als `Bankroll exhausted` gemeldet; die
+Trade-Statistiken darueber decken trotzdem jeden qualifizierten Trade ab.
+
+**Win rate und Profitable auseinanderzuhalten ist der wichtigste Teil.**
+Das Label sagt nur, dass der Preis sich um mindestens `min_price_move`
+(0.001) in die richtige Richtung bewegt hat — nicht, um wie viel. Eine Share,
+die von 0.500 auf 0.501 laeuft, ist ein `win` und zahlt 0,2 %. Die
+Round-Trip-Kosten liegen in diesem Preisbereich bei rund 10 % — der Trade ist
+also trotzdem ein Verlust. Eine Win rate von 98 % bei 1 % profitablen Trades
+ist ein voellig normales Ergebnis und bedeutet: das Modell trifft die
+Richtung, aber die Bewegungen tragen die Kosten nicht.
+
+### Das Kostenmodell (`CostConfig`)
+
+Handelskosten sind **kein** fester Prozentsatz. Sie werden in absoluten
+Preiseinheiten notiert (ein Spread sind so und so viele Ticks), eine Position
+ist aber nur `Tokenpreis` pro Share wert. Der relative Kostenanteil skaliert
+damit mit `1 / Tokenpreis`:
+
+```
+cost(tp) = ( spread_abs + fee_legs * fee_rate * min(tp, 1-tp) ) / tp
+```
+
+| Tokenpreis | Round-Trip-Kosten (Default) |
+|---|---|
+| 0.50 | 10 % |
+| 0.20 | 13 % |
+| 0.10 | 18 % |
+| 0.05 | 28 % |
+| 0.02 | 58 % |
+| 0.01 | 108 % |
+
+Gemessen an 120 aktiven Orderbuechern (Median-Spread nach Preisniveau):
+
+| min(p, 1-p) | Spread absolut | Spread / Preis |
+|---|---|---|
+| 0.35 – 0.50 | 0.0270 | 63 % |
+| 0.20 – 0.35 | 0.0200 | 8 % |
+| 0.10 – 0.20 | 0.0370 | 28 % |
+| 0.05 – 0.10 | 0.0160 | 23 % |
+| 0.02 – 0.05 | 0.0020 | 6 % |
+| 0.00 – 0.02 | 0.0010 | 40 % |
+
+**Kalibrierung:** `spread_abs` ist der einzige empirische Eingabewert und
+streut stark (Quartile ueber die 120 Buecher: 0.001 / 0.010 / 0.039). Der
+Default ist der Median. Setze ihn auf das, was du in *deinen* Maerkten
+tatsaechlich siehst — die `1/tp`-Form gilt unabhaengig von der Konstante.
+
+`fee_rate` ist Polymarkets eigener Satz (Gamma `feeSchedule.rate`, nur Taker):
+Gebuehr pro Share = `rate * min(p, 1-p)`. `fee_legs` ist die Anzahl der Legs,
+die du als Taker ueberquerst — 2 fuer rein und raus als Taker, 1 wenn du als
+Maker aussteigst, 0 fuer eine reine Maker-Strategie.
+
+Trades, deren Kosten `max_cost` (Default 1.0 = der ganze Positionswert)
+uebersteigen, werden als nicht handelbar uebersprungen und unter `Skipped`
+ausgewiesen — statt sie als Beinahe-Totalverlust zu verbuchen.
 
 ---
 
@@ -267,16 +503,24 @@ python benchmark_strategies.py \
 Erwartete Ausgabe (Vergleichstabelle auf dem TEST-Split):
 
 ```
-  Strategy         Dir     Cover     AUC   Brier  WinRate      ROI  Sharpe  Trades
-  ---------------------------------------------------------------------------------
-  baseline         follow  100.0%  0.5000  0.249   51.2%    -4.0%   -0.12   45823
-  random           follow  100.0%  0.5001  0.250   51.2%    -5.1%   -0.15   18350
-  momentum         follow   34.5%  0.5312  0.246   53.4%    +4.2%    0.71     892
-  reversion        AGAINST  12.3%  0.5187  0.248   52.1%    +2.1%    0.31     123
-  volume           follow    8.2%  0.5421  0.243   55.7%    +6.8%    1.12     234
-  closing          follow    5.1%  0.5634  0.238   58.9%    +9.2%    1.41      67
-  contrarian       AGAINST  18.7%  0.5023  0.251   51.3%    +1.5%    0.22     456
+  Strategy         Dir     Cover     AUC   Brier  WinRate Profit%  Ret/Trd    Cost     ROI  Sharpe  Trades
+  ---------------------------------------------------------------------------------------------------------
+  baseline         follow  100.0%  0.5000  0.249   51.2%    1.1%  +0.412%   9.87%   -9.5%  -0.012   45823
+  random           follow  100.0%  0.5001  0.250   51.2%    0.9%  +0.401%   9.91%   -9.5%  -0.015   18350
+  momentum         follow   34.5%  0.5312  0.246   53.4%    2.7%  +0.688%   9.44%   -8.8%   0.071     892
+  reversion        AGAINST  12.3%  0.5187  0.248   52.1%    1.8%  +0.551%  11.20%  -10.7%   0.031     123
+  volume           follow    8.2%  0.5421  0.243   55.7%    3.4%  +0.914%   9.12%   -8.2%   0.112     234
+  closing          follow    5.1%  0.5634  0.238   58.9%    5.9%  +1.203%   8.90%   -7.7%   0.141      67
+  contrarian       AGAINST  18.7%  0.5023  0.251   51.3%    1.2%  +0.470%  14.51%  -14.0%   0.022     456
 ```
+
+`Ret/Trd` ist die mittlere realisierte Preisbewegung pro Trade **vor** Kosten,
+`Cost` sind die mittleren Round-Trip-Kosten. Liegt `Ret/Trd` unter `Cost`, ist
+die Strategie strukturell unprofitabel, egal wie gut ihre AUC aussieht.
+
+Dass `contrarian` die hoechsten Kosten hat, ist kein Zufall: die
+AGAINST-Strategien halten das komplementaere Token, das haeufig das billigere
+und damit relativ teurer zu handelnde ist.
 
 **Strategien im Ueberblick:**
 
@@ -289,6 +533,19 @@ Erwartete Ausgabe (Vergleichstabelle auf dem TEST-Split):
 | `volume` | follow | Ungewoehnlich hohes Volumen = Smart Money, Richtung folgen |
 | `closing` | follow | Nahe Markt-Ende konvergieren Preise zur echten Wahrscheinlichkeit |
 | `contrarian` | AGAINST | Wenn yes_ratio UND Preis beide extrem sind — gegen die Masse wetten |
+| `favourite` | mixed | Immer die **teure** Seite kaufen (testet Longshot-Ueberbewertung) |
+| `longshot` | mixed | Immer die **billige** Seite kaufen — die woertliche Lesart von „gegen den Markt" |
+
+**Dir=mixed** waehlt die Seite pro Zeile, nicht pro Strategie: ob der Favorit
+die dominante Seite ist, wechselt von Bucket zu Bucket. Solche Strategien
+geben ein zusaetzliches `take_dominant`-Array zurueck; Rendite **und** Preis
+werden dann aus derselben Seite genommen.
+
+`favourite` und `longshot` sind exakte Komplemente — gleiche Trade-Anzahl,
+gegensaetzliche Seite. Der strukturelle Unterschied sind die Kosten: in einem
+Testlauf 5,08 % gegen 11,91 %, weil die billige Seite bei `1/Preis`-Kosten
+die teure zu handeln ist. „Immer gegen den Markt" ist damit systematisch die
+teuerste Variante, nicht die lukrativste.
 
 **Dir=follow** benutzt das originale `win`-Label (Wette MIT der Marktmehrheit).
 **Dir=AGAINST** flippt das Label — ROI > 0 bedeutet: die Masse liegt systematisch falsch.
@@ -346,6 +603,20 @@ Logging deaktivieren: `--log-file ''`
 Die Token-ID steht in `markets.csv` in den Spalten `token1` (YES-Seite) oder `token2` (NO-Seite).
 Beispiel: `5313507246...` (256-stellige Zahl).
 
+### Welche API benutzt wird
+
+Trades kommen von `https://data-api.polymarket.com/trades` — der oeffentlichen
+Handelshistorie. **Nicht** von `clob.polymarket.com/trades`: das ist der
+authentifizierte Endpunkt, der die *eigenen* Trades des API-Key-Inhabers
+liefert und ohne Credentials mit `401 Unauthorized` antwortet.
+
+Abgefragt wird pro **Markt** (`conditionId`), nicht pro Token. Die Token-ID auf
+der Kommandozeile wird ueber die Gamma-API zum Markt aufgeloest. Das ist
+zwingend: das Training aggregiert beide Tokens eines Marktes in einen Bucket,
+also ist `yes_ratio` der YES-Anteil aller Fills. Faehrt man nur ein Token ab,
+ist `yes_ratio` konstant und das Feature, auf dem das gesamte Label beruht,
+ist tot.
+
 ### Schritt 3.2a: Direkter API-Abruf (aktive Maerkte)
 
 Funktioniert bei Maerkten mit genuegend Handelsaktivitaet (~300+ Trades pro Stunde):
@@ -356,6 +627,10 @@ python live_bid.py \
     --model model.txt \
     --threshold 0.6
 ```
+
+**Wichtig:** `--bucket-minutes` und `--low-memory` muessen zum Training passen.
+Sonst berechnet das Live-Skript andere Features als das Modell gelernt hat.
+`live_bid.py` warnt, wenn ein Modell-Feature live nicht erzeugt werden kann.
 
 Erwartete Ausgabe:
 ```
@@ -369,19 +644,23 @@ Erwartete Ausgabe:
 =======================================================
 
 [1/5] Loading model...
-  Loaded. Features: 93
-[2/5] Fetching market metadata...
+  Loaded. Features: 92
+[2/5] Resolving market...
   Market : Will X happen before Y?
-  Closes : 2026-06-01T00:00:00Z
-[3/5] Fetching live trades from CLOB API (last ~300 min)...
-  API returned 847 raw trades
-  Trades in window: 612
-[4/5] Aggregating and building features...
-  Buckets: 58 x 5 min
+  Closes : 2026-06-01 00:00:00
+  Your token is the YES side
+[3/5] Fetching trades from data-api (last 5.0 h)...
+  API returned 847 trades in window
+  Usable trades: 847
+[4/5] Building features (training pipeline)...
+  Buckets: 60 x 5 min (gap-filled, current bucket excluded)
+  Scoring bucket: 2026-02-25 14:25:00
 [5/5] Predicting...
 
 =======================================================
-  Current bucket yes_ratio : 0.32
+  Scored bucket            : 2026-02-25 14:25:00
+  Bucket yes_ratio         : 0.32
+  Mean price (P(YES))      : 0.4180
   Dominant side            : NO  (price must fall to win)
   P(win) for NO            : 0.6741  (67.4%)
   Threshold                : 60.0%
@@ -450,26 +729,40 @@ Neuropoly/
 ├── run_pipeline.py         [Phase 1] Komplette Pipeline inkl. Training
 ├── train_chunked.py        [Phase 1] Inkrementelles Training (~25 GB RAM)
 │
+├── classify_markets.py     [Phase 0]  Segment-Map bauen (Sport/Krypto/Politik)
+├── sweep_horizon.py        [Phase 0]  Traegt sich die Haltedauer ueberhaupt?
+│
 ├── evaluate_model.py       [Phase 2]  Modell auswerten ohne Neutraining
 ├── benchmark_strategies.py [Phase 2b] Klassische Strategien vs. Modell vergleichen
 │
 ├── collect_trades.py       [Phase 3] Daemon: Live-Trades → SQLite
 ├── live_bid.py             [Phase 3] Live-Gebot pruefen mit model.txt
+├── paper_trades.py         [Phase 3] Paper-Trading-Simulator mit Logging
 │
 ├── requirements.txt        Python-Abhaengigkeiten
 │
 ├── pipeline/
-│   ├── data_loader.py      Daten laden (CSV/Parquet/SQLite)
+│   ├── data_loader.py      Daten laden (CSV/Parquet/SQLite), Preis → P(YES)
 │   ├── aggregation.py      Trades → 5-Min-Buckets
 │   ├── gap_handler.py      Luecken erkennen + behandeln
-│   ├── features.py         93 Features berechnen
-│   ├── labeling.py         Win/Loss Labels setzen
-│   ├── splitter.py         Train/Val/Test aufteilen
+│   ├── features.py         92 Features berechnen
+│   ├── labeling.py         Win/Loss Labels + realisierte Renditen
+│   ├── splitter.py         Train/Val/Test aufteilen (zeitbasierter Purge)
 │   ├── model.py            LightGBM Training + Inference
 │   ├── monitor.py          Live-Dashboard
-│   └── evaluation.py       Metriken + Backtest
+│   ├── evaluation.py       Metriken + Backtest
+│   ├── polymarket_api.py   Gamma- + data-api-Zugriff (gemeinsam genutzt)
+│   ├── segments.py         Markt-Segmentierung aus dem Slug
+│   ├── rowgroups.py        Invariante "eine Row Group = ein Markt"
+│   ├── live_features.py    Live-Features ueber die Trainings-Codepfade
+│   └── results_logger.py   Historisches Ergebnis-Log
 └── tests/
-    └── test_pipeline_e2e.py  E2E-Test mit Fake-Daten
+    ├── test_pipeline_e2e.py           E2E-Test mit Fake-Daten
+    ├── test_data_loader.py            Preis-Normalisierung
+    ├── test_segments.py               Segmentierung + favourite/longshot
+    ├── test_backtest.py               Backtest-Invarianten
+    ├── test_evaluation.py             Metrik-Randfaelle
+    └── test_streaming_equivalence.py  Batching == Einzelmarkt
 ```
 
 ---
@@ -520,6 +813,7 @@ Neuropoly/
 | `--n-estimators` | `200` | LightGBM-Baeume pro Chunk |
 | `--learning-rate` | `0.05` | Lernrate |
 | `--n-jobs` | `8` | CPU-Kerne |
+| `--context-buckets` | `60` | Vorlauf-Buckets an jeder Chunk-Grenze. **Muss mindestens so gross sein wie das laengste Feature-Fenster** (Default 48), sonst sind Rolling-/Lag-Features an jeder Grenze falsch. `train_chunked.py` warnt. |
 | `--low-memory` | — | Kleineres Modell + weniger Features |
 
 ### evaluate_model.py
@@ -542,10 +836,48 @@ Neuropoly/
 
 | Parameter | Default | Beschreibung |
 |---|---|---|
-| `--token-ids` | — | Eine oder mehrere Token-IDs (Leerzeichen getrennt) |
+| `--token-ids` | — | Eine oder mehrere Token-IDs (Leerzeichen getrennt). Jede wird zu ihrem Markt aufgeloest; gesammelt werden **beide** Tokens |
 | `--db` | `trades.db` | Pfad zur SQLite-Datenbank |
 | `--poll-interval` | `60` | Sekunden zwischen API-Abfragen |
 | `--keep-days` | `7` | Tage Handelshistorie in der DB behalten |
+| `--backfill-hours` | `12` | Wie viel Historie beim ersten Poll geholt wird |
+
+Eine `trades.db` aus einer aelteren Version hat ein anderes Schema (pro Token,
+`is_yes` immer 1). `collect_trades.py` und `live_bid.py` verweigern die Arbeit
+damit, statt die unbrauchbaren Werte stillschweigend zu benutzen — die Datei
+loeschen und neu sammeln.
+
+### paper_trades.py
+
+Simuliert Trades und prueft nach dem Label-Fenster, ob die Entscheidung
+richtig war. Die PnL-Rechnung benutzt die tatsaechliche Preisbewegung; der
+Ausgang wird gegen den Preis im faelligen Bucket geprueft, nicht gegen den
+Preis zum Zeitpunkt des Checks.
+
+```bash
+# Terminal 1: Daten sammeln
+python collect_trades.py --token-ids <TOKEN> --db trades.db
+
+# Terminal 2: simuliert traden
+python paper_trades.py --token-ids <TOKEN> --trades-db trades.db --model model.txt
+
+# Terminal 3: Zwischenstand
+python paper_trades.py --report --paper-db paper_trades.db
+```
+
+| Parameter | Default | Beschreibung |
+|---|---|---|
+| `--token-ids` | — | Token-IDs zum Tracken (ausser bei `--report`) |
+| `--model` | `model.txt` | Pfad zum trainierten Modell |
+| `--threshold` | `0.6` | P(win)-Schwellenwert fuer BID |
+| `--stake` | `100.0` | Simulierter Einsatz pro Trade in USD |
+| `--fee-rate` | `0.02` | Round-Trip-Kosten als Anteil vom Einsatz |
+| `--bucket-minutes` | `5` | Muss zum Training passen |
+| `--forward-window` | `6` | Label-Fenster in Buckets |
+| `--low-memory` | — | Setzen, wenn mit `--low-memory` trainiert wurde |
+| `--trades-db` | `trades.db` | DB von collect_trades.py |
+| `--paper-db` | `paper_trades.db` | Log-DB fuer Entscheidungen |
+| `--report` | — | Nur Report anzeigen, nicht traden |
 
 ### live_bid.py
 
@@ -554,9 +886,18 @@ Neuropoly/
 | `--token-id` | — | Polymarket Token-ID (aus markets.csv token1/token2) |
 | `--model` | `model.txt` | Pfad zum trainierten Modell |
 | `--threshold` | `0.6` | P(win)-Schwellenwert fuer BID (60%) |
-| `--history-buckets` | `60` | Anzahl 5-Min-Buckets (60 = 5 Stunden) |
+| `--history-buckets` | `60` | Anzahl Buckets Historie (60 = 5 Stunden) |
+| `--bucket-minutes` | `5` | **Muss zum Training passen** |
+| `--low-memory` | — | Setzen, wenn mit `--low-memory` trainiert wurde |
 | `--db` | — | SQLite-DB aus collect_trades.py (optional) |
 | `--verbose` | — | Alle Feature-Werte ausgeben |
+
+**Staleness-Warnung:** gescort wird der letzte Bucket, der tatsaechlich
+*existiert*. Auf einem ruhigen Markt kann der Stunden alt sein — in einem
+echten Testlauf lag er bei 11:00, waehrend die Uhr 13:15 zeigte. Ist er
+aelter als drei Bucket-Breiten, weist `live_bid.py` deutlich darauf hin;
+`paper_trades.py` ueberspringt solche Entscheidungen ganz, damit sie die
+Paper-Trading-Statistik nicht wie Live-Performance aussehen lassen.
 
 ---
 
@@ -580,7 +921,21 @@ Neuropoly/
 ### Was ist ein Bucket?
 
 Statt jeden einzelnen Trade zu betrachten, fassen wir alle Trades in 5-Minuten-Fenstern
-zusammen. Das reduziert Rauschen und macht die Daten handhabbar.
+zusammen. Das reduziert Rauschen und macht die Daten handhabbar. Ein Bucket
+enthaelt die Trades **beider** Tokens eines Marktes.
+
+### Preiskonvention: alles ist P(YES)
+
+In `orderFilled.csv` ist `price` der Preis des jeweils gehandelten Tokens —
+token2-Zeilen tragen also den NO-Preis. `pipeline/data_loader.py` rechnet die
+NO-Seite auf `1 - price` um, bevor aggregiert wird.
+
+Ohne das waere `mean_price` eine Mischung beider Seiten: ein Markt bei
+YES = 0.80 mit ausgeglichenem Handelsmix landet bei 0.50, und der Wert bewegt
+sich, sobald sich das YES/NO-Verhaeltnis verschiebt — auch wenn der Markt
+stillsteht. Das Label ("Preis ist gestiegen") wuerde dann genau dieses Artefakt
+messen. Nach der Normalisierung heisst jede Preisspalte dasselbe: P(YES).
+`yes_ratio` traegt den Handelsmix weiterhin als eigenes Feature.
 
 ### Was ist LightGBM?
 
@@ -596,6 +951,16 @@ Das simuliert die echte Situation — du kannst nur aus der Vergangenheit lernen
 |-------- Training --------|-- Gap --|-- Validation --|-- Gap --|--- Test ---|
 Jan 2020                   Jun 2025  Jul 2025          Aug 2025  Sep 2025
 ```
+
+Der Gap wird in **Wandzeit** gemessen, nicht in Zeilen: Label-Fenster
+(`forward_window_buckets x bucket_minutes`, Default 30 Min) plus
+`SplitConfig.split_gap_minutes` (Default 60), also 90 Minuten.
+
+Das ist wichtiger als es klingt. Die Zeilen der Feature-Matrix sind ueber
+tausende Maerkte verschachtelt — ein Gap von "12 Zeilen" waren bei 5 Maerkten
+noch 70 Minuten, bei 100 Maerkten nur noch 5 Minuten und bei realistischer
+Marktzahl praktisch null. Die letzten Trainings-Labels reichten damit in den
+Validierungszeitraum hinein und haben AUC und ROI out-of-sample geschoent.
 
 ### Was ist P(win)?
 
@@ -616,6 +981,30 @@ Jetzt (Bucket t)          +30 Min (Bucket t+6)
 
 - `yes_ratio > 0.5` im Bucket → Mehrheit kauft YES → `win=1` wenn Preis steigt
 - `yes_ratio <= 0.5` im Bucket → Mehrheit kauft NO → `win=1` wenn Preis faellt
+
+**Beide Enden muessen echt sein.** Ein Label entsteht nur, wenn sowohl der
+Einstiegs- als auch der Ausstiegs-Bucket tatsaechlich gehandelt wurde. Der
+Ausstiegspreis stammt aus dem Bucket `forward_window_buckets` spaeter — hat
+der keine Trades, ist sein Preis nur eine Fortschreibung des letzten
+bekannten Werts. Solche Labels sehen nach „keine Bewegung" aus und ziehen die
+gemessene Rendite gegen null.
+
+Auf duennen Daten ist das die Mehrheit: in einem Testlauf beruhten **67,9 %**
+aller Labels auf einem solchen Phantom-Ausstieg (16.830 → 5.402 Labels nach
+dem Fix, mittlere |Rendite| 1,21 % → 1,27 %). Wenn dir die Label-Zahl niedrig
+vorkommt: das ist der Grund, und es ist die richtige Richtung.
+
+`win` sagt nur, **ob** sich der Preis um mindestens 0.001 in die richtige
+Richtung bewegt hat — nicht, um wie viel. Fuer den Backtest berechnet
+`pipeline/labeling.py` deshalb zusaetzlich die tatsaechlich realisierte
+Rendite der Position:
+
+- YES-Seite: kaufen zu `p`, verkaufen zu `p'` → `(p' - p) / p`
+- NO-Seite: kaufen zu `1 - p`, verkaufen zu `1 - p'` → `(p - p') / (1 - p)`
+
+Die beiden Seiten haben unterschiedliche Nenner, weil eine NO-Share `1 - p`
+kostet. Diese Spalten (`trade_return`, `trade_return_opp`) sind **keine**
+Features — sie enthalten die Zukunft und sind vom Feature-Set ausgeschlossen.
 
 ### Was ist der Brier Score?
 

@@ -94,6 +94,21 @@ def _normalize_trades(lf: pl.LazyFrame, cfg: DataConfig) -> pl.LazyFrame:
         .alias("is_yes"),
     )
 
+    # ── Normalise every price to the YES side ────────────────────────────
+    # `price` is USDC per the token that was actually traded, so token2 rows
+    # carry the NO price.  A NO share at 0.20 and a YES share at 0.80 describe
+    # the SAME market state, but averaging them raw makes mean_price a blend
+    # of both sides: it then moves whenever the YES/NO trade mix moves, with
+    # no actual price change behind it — and the label ("price went up") would
+    # be scoring that artefact.  Convert NO prices to their YES equivalent so
+    # every downstream price column means one thing: P(YES).
+    lf = lf.with_columns(
+        pl.when(pl.col("is_yes") == 0)
+        .then(1.0 - pl.col("price"))
+        .otherwise(pl.col("price"))
+        .alias("price"),
+    )
+
     # Parse direction for buy/sell signal
     if cfg.trades_direction_col in lf.collect_schema().names():
         lf = lf.with_columns(
