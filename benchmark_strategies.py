@@ -62,7 +62,11 @@ from pipeline.gap_handler import (
     detect_consecutive_gaps,
     apply_gap_exclusions,
 )
-from pipeline.features import build_features_streaming, get_feature_columns
+from pipeline.features import (
+    build_features_streaming,
+    get_feature_columns,
+    report_degenerate_features,
+)
 from pipeline.labeling import add_labels_streaming, label_stats_lazy
 from pipeline.splitter import walk_forward_split, print_split_info
 from pipeline.evaluation import evaluate, backtest, EvalMetrics, BacktestResult
@@ -616,6 +620,10 @@ def main() -> None:
     )
     lstats = label_stats_lazy(labeled_path)
     print(f"  Labeled: {lstats['labeled']:,}  |  Win rate: {lstats['win_rate']:.3f}")
+    if lstats.get("mean_trade_return") is not None:
+        print(f"  Mean trade return: {lstats['mean_trade_return']:+.5f}")
+
+    report_degenerate_features(labeled_path, feature_cols)
 
     # ── Step 6: Walk-forward split ───────────────────────────────────────────
     print("\n[6/6] Walk-forward split...")

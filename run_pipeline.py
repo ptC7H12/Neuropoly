@@ -39,7 +39,12 @@ from pipeline.gap_handler import (
     detect_consecutive_gaps,
     apply_gap_exclusions,
 )
-from pipeline.features import build_features, build_features_streaming, get_feature_columns
+from pipeline.features import (
+    build_features,
+    build_features_streaming,
+    get_feature_columns,
+    report_degenerate_features,
+)
 from pipeline.labeling import add_labels, label_stats, add_labels_streaming, label_stats_lazy
 from pipeline.splitter import walk_forward_split, print_split_info
 from pipeline.model import train_model, predict, feature_importance
@@ -197,6 +202,10 @@ def main():
     print(f"  Win rate:    {stats['win_rate']:.3f}")
     if stats.get("mean_future_return") is not None:
         print(f"  Mean return: {stats['mean_future_return']:.5f}")
+    if stats.get("mean_trade_return") is not None:
+        print(f"  Mean trade return: {stats['mean_trade_return']:.5f}")
+
+    report_degenerate_features(labeled_path, feature_cols)
 
     # ── Step 6: Train/Val/Test split ───────────────────────────
     print("\n[6/8] Walk-forward split...")

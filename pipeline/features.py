@@ -301,13 +301,21 @@ def _add_cross_features(df: pl.DataFrame) -> pl.DataFrame:
             .alias("trade_size_vs_liquidity"),
         )
 
-    # Volume concentration: bucket volume / market total volume
-    if "volume" in df.columns:
-        df = df.with_columns(
-            (pl.col("total_usd") / pl.col("volume"))
-            .fill_nan(None)
-            .alias("volume_concentration"),
-        )
+    # Volume concentration: bucket volume / volume traded SO FAR.
+    #
+    # The denominator used to be `volume` from the markets table — the
+    # market's total lifetime volume as of the day the CSV was exported.
+    # For a bucket in 2020 that is a number from the future, and because it
+    # is constant per market it also works as a market-identity feature.
+    # The running sum is the point-in-time equivalent.
+    df = df.with_columns(
+        pl.col("total_usd").cum_sum().over("market_id").alias("cum_volume"),
+    )
+    df = df.with_columns(
+        (pl.col("total_usd") / pl.col("cum_volume"))
+        .fill_nan(None)
+        .alias("volume_concentration"),
+    )
 
     # Whale ratio weighted by momentum
     if "whale_count" in df.columns:
@@ -390,6 +398,12 @@ def get_feature_columns(df) -> list[str]:
         "trade_return_opp",
         "question",
         "close_time",
+        # Snapshot columns from the markets table: their value is the state
+        # at export time, not at bucket time, so using them directly is
+        # look-ahead.  They stay in the frame because derived features are
+        # built from them, but they are not fed to the model.
+        "volume",
+        "liquidity",
     }
 
     # Schema objects (returned by collect_schema()) expose .names()
@@ -406,3 +420,52 @@ def _entropy(p: float) -> float:
     if p is None or p <= 0 or p >= 1:
         return 0.0
     return -(p * math.log2(p) + (1 - p) * math.log2(1 - p))
+
+
+def report_degenerate_features(
+    labeled_path: str,
+    feature_cols: list[str],
+    max_listed: int = 10,
+) -> dict[str, list[str]]:
+    """
+    Find features that carry no information: all-null, or a single value.
+
+    A model cannot split on these, so they are dead weight — and an all-null
+    column usually means the source data never had that field (markets.csv
+    has no yes_price / no_price / liquidity, for instance, so
+    convert_to_parquet writes them as null).  Worth knowing before reading a
+    feature-importance table.
+    """
+    import polars as pl
+
+    lf = pl.scan_parquet(labeled_path)
+    present = [c for c in feature_cols if c in lf.collect_schema().names()]
+    if not present:
+        return {"all_null": [], "constant": []}
+
+    stats = lf.select(
+        [pl.col(c).null_count().alias(f"{c}__nulls") for c in present]
+        + [pl.col(c).n_unique().alias(f"{c}__uniq") for c in present]
+        + [pl.len().alias("__n")]
+    ).collect()
+
+    n = int(stats["__n"][0])
+    all_null, constant = [], []
+    for c in present:
+        if int(stats[f"{c}__nulls"][0]) == n:
+            all_null.append(c)
+        elif int(stats[f"{c}__uniq"][0]) <= 1:
+            constant.append(c)
+
+    if all_null or constant:
+        print("\n  Degenerate features (no information for the model):")
+        if all_null:
+            shown = ", ".join(all_null[:max_listed])
+            more = f" (+{len(all_null) - max_listed} more)" if len(all_null) > max_listed else ""
+            print(f"    all null ({len(all_null)}): {shown}{more}")
+        if constant:
+            shown = ", ".join(constant[:max_listed])
+            more = f" (+{len(constant) - max_listed} more)" if len(constant) > max_listed else ""
+            print(f"    constant ({len(constant)}): {shown}{more}")
+
+    return {"all_null": all_null, "constant": constant}
