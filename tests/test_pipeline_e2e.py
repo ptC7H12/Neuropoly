@@ -68,6 +68,46 @@ def generate_synthetic_trades(
     return df.sort("timestamp").lazy()
 
 
+def write_raw_trades_parquet(
+    path,
+    n_markets: int = 5,
+    trades_per_market: int = 5000,
+    seed: int = 42,
+):
+    """
+    Write trades in the RAW on-disk schema, i.e. what convert_to_parquet
+    produces and pipeline/data_loader consumes.
+
+    The difference to generate_synthetic_trades() matters: on disk, `price`
+    is the price of the token that was actually traded, so token2 rows carry
+    the NO price (1 - p).  A fixture that puts YES prices on both sides never
+    exercises the normalisation in data_loader — and, once normalisation is
+    applied to it, produces a bimodal price series and absurd returns.
+    """
+    df = generate_synthetic_trades(
+        n_markets=n_markets, trades_per_market=trades_per_market, seed=seed
+    ).collect()
+
+    df = df.with_columns(
+        pl.when(pl.col("is_yes") == 1)
+        .then(pl.lit("token1"))
+        .otherwise(pl.lit("token2"))
+        .alias("side"),
+        # Undo the YES convention: a NO fill is quoted at 1 - P(YES)
+        pl.when(pl.col("is_yes") == 1)
+        .then(pl.col("price"))
+        .otherwise(1.0 - pl.col("price"))
+        .alias("price"),
+        pl.when(pl.col("is_buy") == 1)
+        .then(pl.lit("BUY"))
+        .otherwise(pl.lit("SELL"))
+        .alias("direction"),
+    ).drop(["is_yes", "is_buy"])
+
+    df.write_parquet(path)
+    return path
+
+
 def generate_synthetic_markets(n_markets: int = 5) -> pl.DataFrame:
     """Generate synthetic market snapshot data."""
 
@@ -113,9 +153,18 @@ def _run_full_pipeline():
     cfg.monitor.log_file = None
     cfg.monitor.log_interval = 20
 
-    # Generate data
+    # Generate data in the raw on-disk schema and load it through the real
+    # loader, so price normalisation is part of what this test covers.
     print("\n[1] Generating synthetic data...")
-    trades_lf = generate_synthetic_trades(n_markets=5, trades_per_market=5000)
+    raw_path = Path("_e2e_trades.parquet")
+    write_raw_trades_parquet(raw_path, n_markets=5, trades_per_market=5000)
+
+    from config import DataConfig
+    from pipeline.data_loader import load_trades
+
+    trades_lf = load_trades(
+        DataConfig(trades_path=str(raw_path), trades_format="parquet")
+    )
     markets_df = generate_synthetic_markets(n_markets=5)
     print(f"  Trades: {trades_lf.collect().height} rows")
     print(f"  Markets: {markets_df.height} rows")
@@ -225,6 +274,7 @@ def _run_full_pipeline():
 def _cleanup() -> None:
     """Remove the intermediate Parquet files this test writes."""
     for name in (
+        "_e2e_trades.parquet",
         "bucketed.parquet",
         "test_filled.parquet",
         "test_filled_gaps.parquet",
