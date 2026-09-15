@@ -224,6 +224,20 @@ def merge_existing_ids(df: pl.DataFrame, out_path: str) -> pl.DataFrame:
             pl.col("market_id").cast(pl.Int32)
         )
 
+    # The join partner needs the same dedup as the input.  A registry written
+    # before load_markets() deduped carries duplicate condition_ids, and a left
+    # join against those *multiplies* rows: one duplicated prior row turns one
+    # input market into two identical output rows sharing a market_id.  Seen in
+    # practice — 3,386,625 deduped markets came back out as 3,411,290, exactly
+    # the 24,665 duplicates the previous registry still held.
+    before = prior.height
+    prior = prior.unique(subset=["condition_id"], keep="first")
+    if prior.height < before:
+        print(
+            f"  Prior registry had {before - prior.height:,} duplicate "
+            f"condition_ids — deduped before the join"
+        )
+
     df = df.join(prior, on="condition_id", how="left")
     next_id = int(prior["market_id"].max()) + 1
     fresh = df.filter(pl.col("market_id").is_null()).height
@@ -349,6 +363,20 @@ def main() -> int:
         "exclude_reason",
         "keep",
     ).sort("market_id")
+
+    # One row per market, one id per market.  Both have been violated by a
+    # silent row multiplication before (see merge_existing_ids), and a
+    # duplicated market_id makes every downstream trades join quietly wrong —
+    # so fail loudly here rather than write a corrupt registry.
+    dupes = registry.height - registry["condition_id"].n_unique()
+    if dupes:
+        raise SystemExit(
+            f"ABORT: {dupes:,} duplicate condition_ids in the registry "
+            f"({registry.height:,} rows). Refusing to write a registry whose "
+            f"join key is not unique."
+        )
+    if registry["market_id"].n_unique() != registry.height:
+        raise SystemExit("ABORT: market_id is not unique.")
 
     report(registry)
     if args.validate:
