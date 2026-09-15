@@ -27,6 +27,7 @@ labeled.parquet
 labeled_*.parquet
 _chunk_*.parquet
 results_log.jsonl
+*.log
 paper_trades.db
 trades.db
 _eval_tmp/
