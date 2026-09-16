@@ -283,6 +283,55 @@ empirical input and the quartiles across 120 live order books are
 0.001 / 0.010 / 0.039. Re-run with the value actually seen in the markets to be
 traded before treating any of these numbers as final.
 
+## D2 result (2026-09-16) — the grouping question is closed
+
+One model, one split, 8 h horizon, scored separately on each segment's test rows.
+
+| segment | rows | AUC | Brier | WinRate | Profit% | ROI | Sharpe | trades |
+|---|---|---|---|---|---|---|---|---|
+| other | 66,462 | 0.6027 | 0.241 | 66.3 % | 27.9 % | −1.4 % | 0.08 | 11,855 |
+| politics | 16,870 | 0.5933 | 0.244 | 63.1 % | 25.8 % | −2.0 % | 0.06 | 2,897 |
+
+**The AUC gap is 0.0094.** Against the stopping rule that is "streut kaum" —
+one model already covers both segments equally well. Separate models are not
+justified, and D3 has little left to win either: a categorical feature can only
+help where the groups actually behave differently, and here they do not.
+
+### The original question, answered at three levels
+
+| Level | Verdict | Where measured |
+|---|---|---|
+| per market | impossible — median market has 3 active buckets | D0 |
+| per family | impossible — no trainable family reaches 1000 markets, largest is 111, 45.7 % are singletons | D0 |
+| per segment | not worth it — costs converge by 1 d, AUC differs by 0.009 | D1, D2 |
+
+## The real obstacle is cost, not the model
+
+The global backtest: **ROI −1.55 %** on 14,752 trades. Win rate 65.7 %, but
+only 27.5 % profitable after fees. Mean return per trade **+3.82 %** against
+mean cost **5.37 %** — the 1.55 pp shortfall *is* the ROI.
+
+So the model discriminates (AUC 0.60, two thirds of trades move the right way)
+and still loses money, exactly the failure mode `README.md` warns about: it
+gets the direction right, and the moves do not carry the costs.
+
+Two consequences worth acting on before more modelling:
+
+1. **`spread_abs` is an assumption, not a measurement.** Everything above uses
+   0.01, the median of 120 live order books whose quartiles are
+   0.001 / 0.010 / 0.039. At the lower quartile the cost side of that
+   comparison collapses and the sign of the ROI flips. Measuring the real
+   spread in the markets actually traded is now the single highest-value work
+   left — larger than any modelling change.
+
+2. **The training target does not match the economic objective.** `win` is
+   binary: did the price move at least `min_price_move` (0.001) the right way.
+   A move of 0.001 and a move of 0.05 are the same label. The model therefore
+   optimises *direction*, while profitability needs *magnitude*. Raising the
+   entry threshold selects for confident direction, not for large moves, so it
+   cannot fix this on its own. A magnitude-aware label — or a regression on
+   `trade_return` — addresses it directly.
+
 ## The diagnostic (remaining stages)
 
 Five stages, each may stop the next. **Blocked on `processed/trades.csv`**,
