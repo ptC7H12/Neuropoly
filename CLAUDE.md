@@ -17,6 +17,7 @@ that overcommits takes the *host* down, not just itself. That has happened:
 the machine rebooted.
 
 ```bash
+cd /root/Neuropoly
 ./runguard.sh --max-rss 10 --min-avail 14 -- .venv/bin/python -u <script> ...
 ```
 
@@ -48,8 +49,12 @@ repair it — it fails silently, writing an empty `trades.parquet`.
 ## Environment
 
 ```bash
-.venv/bin/python -m pytest tests/ -q      # 56 tests, all offline
+cd /root/Neuropoly && .venv/bin/python -m pytest tests/ -q    # 56 tests, offline
 ```
+
+**Every command here assumes `/root/Neuropoly`.** Sessions on this box start in
+`/root/poly_data` — the collector's directory, not this one — so a bare
+`.venv/bin/python paper_trades.py` fails with a confusing "No such file".
 
 `uv` lives at `/root/.local/bin/uv`. LightGBM needs `libgomp1` (apt) or every
 training run dies with `libgomp.so.1: cannot open shared object file`.
@@ -89,7 +94,7 @@ These have all bitten. None of them raise.
   markets are scorable.
 
 ```bash
-.venv/bin/python paper_trades.py --report --paper-db paper_trades.db
+cd /root/Neuropoly && .venv/bin/python paper_trades.py --report --paper-db paper_trades.db
 ```
 
 - **Next, ranked:** train on magnitude instead of direction; position sizing;
