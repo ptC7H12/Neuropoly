@@ -30,6 +30,17 @@ heredoc.
 Stop daemons by **noted PID**, never `pkill -f` — a pattern that matches your
 own command line kills the guard and leaves the compute running unguarded.
 
+**Check daemons by PID file, never by `pgrep -f`, for the same reason.** A
+`pgrep -f run_pipeline.sh` issued from a shell whose own command line contains
+that string matches itself and reports "running" for a process that died hours
+ago. That happened: the poly_data collection was dead for four hours while
+every check said it was alive. Use the script's own status command, which reads
+the pid file:
+
+```bash
+cd /root/poly_data && ./run_pipeline.sh --status   # says "not running (stale pid file)"
+```
+
 ## Where the data comes from
 
 `/root/poly_data` — a fork of `warproxxx/poly_data` **v2** on this same box.

@@ -37,3 +37,5 @@ _eval_tmp/
 _bench_tmp/
 _test_stream/
 _sweep_tmp/
+sweep/
+sweep_smoke/
