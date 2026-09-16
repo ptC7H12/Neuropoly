@@ -300,7 +300,7 @@ never there.
 Report at any time:
 
 ```bash
-.venv/bin/python paper_trades.py --report --paper-db paper_trades.db
+cd /root/Neuropoly && .venv/bin/python paper_trades.py --report --paper-db paper_trades.db
 ```
 
 ## Selecting the markets exposed a bigger constraint than the spread

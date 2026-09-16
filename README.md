@@ -65,6 +65,7 @@ mv results_log.jsonl results_log.old.jsonl 2>/dev/null || true
 >   reisst den *ganzen Host* mit. Das ist bereits passiert.
 >
 >   ```bash
+>   cd /root/Neuropoly
 >   ./runguard.sh --max-rss 10 --min-avail 14 -- .venv/bin/python -u <skript> ...
 >   ```
 
