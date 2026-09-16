@@ -63,6 +63,7 @@ def train_model(
     monitor_cfg: MonitorConfig,
     save_path: Optional[str] = "model.txt",
     weight_mode: str = "none",
+    seed: int = 42,
 ) -> tuple[lgb.Booster, TrainingMonitor]:
     """
     Train a LightGBM model with live monitoring.
@@ -111,7 +112,14 @@ def train_model(
     # Add metrics
     params["metric"] = ["binary_logloss", "auc"]
     params["verbose"] = -1
-    params["seed"] = 42
+    # Der Seed war hier hart auf 42 verdrahtet und ignorierte PipelineConfig.seed.
+    # Fuer eine Parametersuche ist das fatal: ohne mehrere Seeds je Kombination
+    # laesst sich nicht trennen, ob eine Konfiguration besser ist oder nur
+    # glueckliger. Der Default bleibt 42, damit bestehende Laeufe unveraendert
+    # reproduzieren.
+    params["seed"] = seed
+    params["bagging_seed"] = seed
+    params["feature_fraction_seed"] = seed
 
     # Train
     callbacks = [
