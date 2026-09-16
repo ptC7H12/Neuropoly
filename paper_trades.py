@@ -49,6 +49,7 @@ from pipeline.live_features import (
     is_stale,
 )
 from pipeline.polymarket_api import (
+    fetch_book,
     MarketInfo,
     PolymarketAPIError,
     fetch_market,
@@ -88,6 +89,35 @@ def init_paper_db(db_path: str) -> sqlite3.Connection:
             pnl           REAL                -- realisierter PnL nach Kosten
         )
     """)
+
+    # Spalten fuer die Ausfuehrungsmessung nachziehen.
+    #
+    # Warum ueberhaupt: der ganze Unterschied zwischen Verlust und Gewinn liegt
+    # in der Ausfuehrung, nicht im Modell.  Als Taker rein und raus kostet der
+    # Backtest -0.32% ROI, mit Maker-Ausstieg +1.69%.  Ob dieser Vorteil real
+    # ist, haengt an zwei Zahlen, die sich nicht simulieren lassen: wie oft eine
+    # ruhende Limit-Order fuellt, und wie teuer der Ausstieg wird, wenn sie es
+    # nicht tut.  Beides wird hier gemessen statt angenommen.
+    #
+    # ALTER TABLE einzeln und fehlertolerant, damit bestehende DBs
+    # weiterbenutzbar bleiben.
+    for col, decl in [
+        ("best_bid",         "REAL"),     # Orderbuch zur Entscheidungszeit
+        ("best_ask",         "REAL"),
+        ("spread",           "REAL"),
+        ("bid_size",         "REAL"),     # Tiefe: ein enger Spread mit fuenf
+        ("ask_size",         "REAL"),     # Anteilen dahinter ist wertlos
+        ("limit_exit",       "REAL"),     # Kurs der ruhenden Ausstiegsorder
+        ("limit_filled",     "INTEGER"),  # hat sie gefuellt?
+        ("limit_fill_ts",    "TEXT"),     # wann
+        ("pnl_taker",        "REAL"),     # PnL wenn man rauskreuzt
+        ("pnl_maker",        "REAL"),     # PnL mit Limit-Ausstieg
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass                            # Spalte existiert bereits
+    conn.commit()
     conn.commit()
     return conn
 
@@ -131,7 +161,8 @@ def check_pending_outcomes(
     """Prueft alle offenen Entscheidungen deren outcome_due erreicht ist."""
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     pending = paper_conn.execute("""
-        SELECT id, condition_id, direction, entry_price, stake, fee_rate, outcome_due
+        SELECT id, condition_id, direction, entry_price, stake, fee_rate, outcome_due,
+               ts, limit_exit
         FROM decisions
         WHERE bid=1 AND outcome_checked=0 AND outcome_due <= ?
     """, (now_str,)).fetchall()
@@ -141,15 +172,16 @@ def check_pending_outcomes(
 
     print(f"\n[Outcome-Check] {len(pending)} offene Entscheidung(en) pruefen...")
 
-    for row_id, cond_id, direction, entry, stake, fee_rate, due_str in pending:
+    for (row_id, cond_id, direction, entry, stake, fee_rate, due_str,
+         entry_ts_str, limit_exit) in pending:
         due = datetime.strptime(due_str, "%Y-%m-%dT%H:%M:%SZ")
         market = markets.get(cond_id)
 
-        # Handelsdaten um den Faelligkeitszeitpunkt herum holen
-        window_start = int(
-            (due - timedelta(minutes=cfg.bucket.bucket_minutes * 2))
-            .replace(tzinfo=timezone.utc).timestamp()
-        )
+        # Ab dem EINSTIEG laden, nicht erst kurz vor Faelligkeit: die
+        # Limit-Order liegt die ganze Haltedauer im Buch, und ob sie gefuellt
+        # haette, entscheidet sich irgendwann dazwischen.
+        entry_dt = datetime.strptime(entry_ts_str, "%Y-%m-%dT%H:%M:%SZ")
+        window_start = int(entry_dt.replace(tzinfo=timezone.utc).timestamp())
         trades = _load_trades(cond_id, market, window_start, args)
         exit_price = _price_at(trades, due, cfg.bucket.bucket_minutes)
 
@@ -170,16 +202,51 @@ def check_pending_outcomes(
 
         pnl = stake * (ret - fee_rate)
 
+        # Haette die ruhende Limit-Order gefuellt?
+        #
+        # Eine Verkaufs-Limit fuellt, wenn jemand zu ihrem Kurs kauft — und
+        # genau das steht als Trade-Print in den Daten.  Fuer eine YES-Position
+        # heisst das ein Print bei P(YES) >= Limit, fuer NO bei <= Limit.
+        #
+        # Das ist eine OBERGRENZE fuer die Fuellquote: es ignoriert die
+        # Warteschlange.  Ein Print zu meinem Kurs kann jemanden vor mir
+        # bedient haben.  Die gemessene Quote ist also optimistisch, und das
+        # ist die richtige Richtung — faellt der Vorteil schon hier weg, ist er
+        # auch real nicht da.
+        limit_filled, fill_ts = 0, None
+        if limit_exit is not None and not trades.is_empty():
+            span = trades.filter(
+                (pl.col("timestamp") >= entry_dt.replace(tzinfo=None))
+                & (pl.col("timestamp") <= due)
+            )
+            hits = span.filter(
+                (pl.col("price") >= limit_exit) if direction == "YES"
+                else (pl.col("price") <= limit_exit)
+            )
+            if not hits.is_empty():
+                limit_filled = 1
+                fill_ts = str(hits["timestamp"].min())
+
+        if limit_filled:
+            # Zum Limitkurs raus, und nur ein Leg als Taker bezahlt.
+            ret_lim = ((limit_exit - entry_c) / entry_c if direction == "YES"
+                       else (entry_c - limit_exit) / (1.0 - entry_c))
+            pnl_maker = stake * (ret_lim - fee_rate / 2)
+        else:
+            pnl_maker = pnl          # nicht gefuellt -> doch rauskreuzen
+
         paper_conn.execute("""
             UPDATE decisions
-            SET outcome_checked=1, exit_price=?, trade_return=?, won=?, pnl=?
+            SET outcome_checked=1, exit_price=?, trade_return=?, won=?, pnl=?,
+                limit_filled=?, limit_fill_ts=?, pnl_taker=?, pnl_maker=?
             WHERE id=?
-        """, (exit_price, ret, won, pnl, row_id))
+        """, (exit_price, ret, won, pnl, limit_filled, fill_ts, pnl, pnl_maker, row_id))
         paper_conn.commit()
 
         symbol = "GEWONNEN" if won else "VERLOREN"
+        fill = f" | Limit {'GEFUELLT' if limit_filled else 'nicht gefuellt'}" if limit_exit else ""
         print(f"  ID {row_id}: {direction} | Entry {entry:.4f} -> Exit {exit_price:.4f} "
-              f"| {symbol} | Rendite {ret:+.3%} | PnL ${pnl:+.2f}")
+              f"| {symbol} | Rendite {ret:+.3%} | PnL ${pnl:+.2f}{fill}")
 
 
 # ── Daten laden ───────────────────────────────────────────────────────────────
@@ -288,6 +355,40 @@ def print_report(paper_db: str) -> None:
             print(f"  {name:<40} {trades:>7} {wr:>6.1%} {(ret or 0):>+8.2%} "
                   f"${pnl or 0:>9.2f}")
 
+    # ── Ausfuehrung: Maker gegen Taker ───────────────────────────────────
+    #
+    # Die eigentliche Frage dieses Laufs.  Der Backtest sagt -0.32% ROI als
+    # reiner Taker und +1.69% mit Maker-Ausstieg, aber das unterstellt, dass
+    # jede Limit-Order fuellt.  Hier steht, wie oft sie es wirklich tut.
+    ex = conn.execute("""
+        SELECT COUNT(*), COALESCE(SUM(limit_filled),0),
+               COALESCE(SUM(pnl_taker),0), COALESCE(SUM(pnl_maker),0),
+               COALESCE(AVG(spread),0)
+        FROM decisions
+        WHERE bid=1 AND outcome_checked=1 AND limit_exit IS NOT NULL
+    """).fetchone()
+    n_ex, n_fill, pnl_t, pnl_m, avg_spread = ex
+    if n_ex:
+        print(f"\n  AUSFUEHRUNG  ({n_ex} gepruefte Entscheidungen mit Orderbuch)")
+        print(f"    Fuellquote der Limit-Order : {n_fill}/{n_ex} = {n_fill/n_ex:.1%}")
+        print(f"    Mittlerer Spread           : {avg_spread:.4f}")
+        print(f"    PnL als reiner Taker       : ${pnl_t:+.2f}")
+        print(f"    PnL mit Maker-Ausstieg     : ${pnl_m:+.2f}")
+        print(f"    Differenz                  : ${pnl_m - pnl_t:+.2f}")
+        # Fuellquote getrennt nach Ausgang — das ist die adverse Selektion.
+        for label, cond in (("Gewinner", "won=1"), ("Verlierer", "won=0")):
+            r = conn.execute(f"""
+                SELECT COUNT(*), COALESCE(SUM(limit_filled),0) FROM decisions
+                WHERE bid=1 AND outcome_checked=1 AND limit_exit IS NOT NULL AND {cond}
+            """).fetchone()
+            if r[0]:
+                print(f"      davon {label:<9}: {r[1]}/{r[0]} = {r[1]/r[0]:.1%} gefuellt")
+        print("    (Fuellquote ist eine Obergrenze — die Warteschlange im Buch")
+        print("     ist nicht modelliert; ein Print zu meinem Kurs kann jemand")
+        print("     anderen bedient haben.)")
+    else:
+        print("\n  AUSFUEHRUNG: noch keine gepruefte Entscheidung mit Orderbuch.")
+
     print("=" * 62)
     conn.close()
 
@@ -372,14 +473,32 @@ def trading_loop(args, cfg: PipelineConfig, booster: lgb.Booster,
             bid = 1 if p_win >= args.threshold else 0
             outcome_due = (now + timedelta(minutes=horizon)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+            # Live-Orderbuch mitschreiben.  Der Limitkurs liegt einen vollen
+            # Spread guenstiger als der Einstieg: statt den Spread zweimal zu
+            # zahlen, soll er einmal verdient werden.  In P(YES) gerechnet
+            # heisst das fuer eine YES-Position nach oben, fuer NO nach unten.
+            book = fetch_book(market.token_yes)
+            book_bid = book["bid"] if book else None
+            book_ask = book["ask"] if book else None
+            book_spread = book["spread"] if book else None
+            book_bidsz = book["bid_size"] if book else None
+            book_asksz = book["ask_size"] if book else None
+            limit_exit = None
+            if book and entry_price is not None:
+                limit_exit = round(
+                    entry_price + book["spread"] if direction == "YES"
+                    else entry_price - book["spread"], 6)
+
             paper_conn.execute("""
                 INSERT INTO decisions
                 (ts, token_id, condition_id, question, direction, p_win, threshold,
-                 bucket_time, entry_price, yes_ratio, stake, fee_rate, bid, outcome_due)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 bucket_time, entry_price, yes_ratio, stake, fee_rate, bid, outcome_due,
+                 best_bid, best_ask, spread, bid_size, ask_size, limit_exit)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (now_str, market.token_yes, cond_id, market.question[:100], direction,
                   p_win, args.threshold, str(bucket_time), entry_price, yes_ratio,
-                  args.stake, args.fee_rate, bid, outcome_due))
+                  args.stake, args.fee_rate, bid, outcome_due,
+                  book_bid, book_ask, book_spread, book_bidsz, book_asksz, limit_exit))
             paper_conn.commit()
 
             if bid:

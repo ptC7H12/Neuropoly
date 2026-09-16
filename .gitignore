@@ -13,6 +13,9 @@ training_log.jsonl
 data/
 *.sqlite
 *.db
+*.db-wal
+*.db-shm
+*.pid
 .env
 bucketed.parquet
 bucketed_*.parquet

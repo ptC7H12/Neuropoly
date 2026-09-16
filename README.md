@@ -38,6 +38,36 @@ mv results_log.jsonl results_log.old.jsonl 2>/dev/null || true
 
 ## Uebersicht
 
+> ## Aktueller Datenpfad (Stand 2026-09-16)
+>
+> Die Schritte [1]–[4] unten beschreiben den urspruenglichen Ablauf. Der
+> Datenpfad hat sich geaendert; Details in **`docs/universe-and-grouping.md`**,
+> Kurzfassung hier:
+>
+> ```
+> poly_data (sammelt nur)          Neuropoly (wertet aus und trainiert)
+>   markets.csv      ──▶ build_registry.py  ──▶ data/market_registry.parquet
+>   orderFilled.csv  ──▶ build_trades.py    ──▶ data/trades.parquet
+>                                                 (nur das trainierbare Universum)
+>                        census_markets.py  ──▶ was ist ueberhaupt trainierbar?
+>                        measure_spread.py  ──▶ echte Orderbuch-Spreads
+> ```
+>
+> * **`convert_to_parquet.py` ist abgeloest.** Es erwartet poly_datas
+>   v1-Schema und scheitert **still** — es schreibt eine leere
+>   `trades.parquet`, ohne zu meckern. Nicht reparieren, nicht benutzen.
+> * **Das Universum ist gefiltert.** 5-Minuten-Kerzen, Sportergebnisse,
+>   Krypto- und Aktienkurse fliegen raus: von 3,39 Mio. Maerkten bleiben
+>   907.991 (26,8 %), und davon sind 8.767 tatsaechlich trainierbar. Regeln in
+>   `pipeline/universe.py`.
+> * **Jeder schwere Lauf gehoert hinter `runguard.sh`.** Diese Box ist ein
+>   LXC-Gast ohne cgroup-Limit und ohne Swap — ein Prozess, der uebercommittet,
+>   reisst den *ganzen Host* mit. Das ist bereits passiert.
+>
+>   ```bash
+>   ./runguard.sh --max-rss 10 --min-avail 14 -- .venv/bin/python -u <skript> ...
+>   ```
+
 ```
 markets.csv + orderFilled.csv
         |
@@ -45,7 +75,7 @@ markets.csv + orderFilled.csv
 [0] sweep_horizon.py            Traegt sich die Haltedauer? (vor allem anderen)
         |
         v
-[1] convert_to_parquet.py       CSV → Parquet (chunk-weise, < 1 GB RAM)
+[1] convert_to_parquet.py       CSV → Parquet  (ABGELOEST, s. o.)
         |
         v
 [2] run_pipeline.py             Bucketing → Features → Labels → Training → model.txt
@@ -725,7 +755,13 @@ Das Modell erkennt automatisch welche Seite dominant ist:
 Neuropoly/
 ├── config.py               Alle Parameter zentral konfigurierbar
 │
-├── convert_to_parquet.py   [Phase 1] CSV → Parquet (chunk-weise, RAM-schonend)
+├── build_registry.py       [Bruecke]  markets.csv → Registry (stabile Int32-IDs)
+├── build_trades.py         [Bruecke]  orderFilled.csv → gefilterte trades.parquet
+├── census_markets.py       [D0]       Trainierbarkeits-Zaehlung
+├── measure_spread.py       [Kosten]   echte Spreads aus den Live-Orderbuechern
+├── runguard.sh             [Betrieb]  Speicherbremse fuer jeden schweren Lauf
+│
+├── convert_to_parquet.py   [ABGELOEST] erwartet poly_data v1, scheitert still
 ├── run_pipeline.py         [Phase 1] Komplette Pipeline inkl. Training
 ├── train_chunked.py        [Phase 1] Inkrementelles Training (~25 GB RAM)
 │
@@ -742,6 +778,8 @@ Neuropoly/
 ├── requirements.txt        Python-Abhaengigkeiten
 │
 ├── pipeline/
+│   ├── universe.py         Ausschlussregeln (periodic/sports/crypto/asset_price)
+│   ├── families.py         Slug → Familie, Erkennung getakteter Kurzlaeufer
 │   ├── data_loader.py      Daten laden (CSV/Parquet/SQLite), Preis → P(YES)
 │   ├── aggregation.py      Trades → 5-Min-Buckets
 │   ├── gap_handler.py      Luecken erkennen + behandeln

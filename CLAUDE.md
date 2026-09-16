@@ -4,29 +4,46 @@ LightGBM pipeline predicting P(win) for Polymarket trades. CPU-only.
 
 ## Read this first
 
-`docs/universe-and-grouping.md` carries the current line of work: which markets
-are trainable, why, and the staged diagnostic (D0-D4) that decides whether
-per-group models are worth building. It is written to be picked up cold.
+`docs/universe-and-grouping.md` carries the whole line of work: which markets
+are trainable and why, what the diagnostics found, and — the part that matters
+most — that **execution, not the model, decides profit**. It is written to be
+picked up cold.
+
+## Never run a heavy job unguarded
+
+This box is an **LXC guest with no cgroup memory cap and no swap**, so a process
+that overcommits takes the *host* down, not just itself. That has happened:
+`run_pipeline.py` pushed MemAvailable from 15.4 to 4.4 GiB in six seconds and
+the machine rebooted.
+
+```bash
+./runguard.sh --max-rss 10 --min-avail 14 -- .venv/bin/python -u <script> ...
+```
+
+Two independent limits, because they fail differently: `--max-rss` catches this
+job's own growth, `--min-avail` catches the case where this job is innocent and
+something else is eating memory. Poll every 2 s — at 5 s the crash above would
+have been missed. It does **not** pass stdin, so pass a script path, not a
+heredoc.
+
+Stop daemons by **noted PID**, never `pkill -f` — a pattern that matches your
+own command line kills the guard and leaves the compute running unguarded.
 
 ## Where the data comes from
 
-`/root/poly_data` — a fork of `warproxxx/poly_data` **v2**, running on this
-same box. **It collects; this repo joins, filters and trains.** It runs with
-`PIPELINE_STAGES=collect` (markets + chain), so `processed/trades.csv` is not
-produced — see `docs/universe-and-grouping.md` for the measurements behind
-that split.
+`/root/poly_data` — a fork of `warproxxx/poly_data` **v2** on this same box.
+**It collects; this repo joins, filters and trains.** It runs with
+`PIPELINE_STAGES=collect`, so `processed/trades.csv` is never produced.
 
-The two-step bridge, in order:
+```
+markets.csv  ──build_registry.py──▶  data/market_registry.parquet
+orderFilled.csv ──build_trades.py─▶  data/trades.parquet      (universe only)
+                 census_markets.py ▶  D0: what is trainable
+                measure_spread.py  ▶  live order books
+```
 
-1. `build_registry.py` — `markets.csv` -> `data/market_registry.parquet`.
-   Re-run after poly_data appends markets; ids stay stable.
-2. `build_trades.py` — `orderFilled.csv` -> `data/trades.parquet`, joined
-   against the registry and filtered to the universe *during* the scan. That
-   filter is a 16x reduction at event level, not the 3.7x the market counts
-   suggest, because the excluded candle instruments are hyperactive.
-
-`convert_to_parquet.py` targets poly_data **v1** and is superseded by both.
-Do not repair it; it fails silently (writes an empty `trades.parquet`).
+`convert_to_parquet.py` targets poly_data **v1** and is superseded. Do not
+repair it — it fails silently, writing an empty `trades.parquet`.
 
 ## Environment
 
@@ -34,45 +51,50 @@ Do not repair it; it fails silently (writes an empty `trades.parquet`).
 .venv/bin/python -m pytest tests/ -q      # 56 tests, all offline
 ```
 
-- The venv is `uv`-managed; `uv` lives at `/root/.local/bin/uv`.
-- LightGBM needs `libgomp1` (apt). Without it `test_pipeline_e2e` fails with
-  `libgomp.so.1: cannot open shared object file`.
-- This host is an **LXC guest with no cgroup memory cap and no swap**, so the
-  *host* OOM killer takes processes with no trace in `dmesg` or `journalctl` —
-  a long run can simply vanish. `/root/poly_data/ram_watchdog.sh` watches
-  `MemAvailable` and stops the pipeline before that happens.
+`uv` lives at `/root/.local/bin/uv`. LightGBM needs `libgomp1` (apt) or every
+training run dies with `libgomp.so.1: cannot open shared object file`.
 
 ## Invariants that break quietly
 
-These have all bitten already. None of them raise.
+These have all bitten. None of them raise.
 
 1. **One row group = one market** (`pipeline/rowgroups.py`). Every lag, rolling
-   window and label is `.over("market_id")`. Longest window is 48 buckets =
-   4 h, so a market shorter than that yields no complete feature row.
-2. **`market_id` must stay unique.** poly_data's `markets.csv` can list a
-   market twice, and joining against a duplicated prior registry multiplies
-   rows. `build_registry.py` asserts uniqueness before writing.
+   window and label is `.over("market_id")`; the longest window is 48 buckets,
+   so a market shorter than that yields no complete feature row.
+2. **`market_id` must stay unique.** poly_data's `markets.csv` can list a market
+   twice, and joining against a duplicated prior registry multiplies rows.
+   `build_registry.py` asserts uniqueness before writing.
 3. **`market_id` must stay stable** across filter changes and export growth, or
-   every Parquet built earlier points at the wrong markets. Ids are therefore
-   assigned to *all* markets and reused from the prior registry.
-4. **`segments.py` is precision-tuned**, which is correct for *selecting* a
+   every Parquet built earlier points at the wrong markets. Ids are assigned to
+   *all* markets and reused from the prior registry.
+4. **`segments.py` is precision-tuned**, which is right for *selecting* a
    segment and wrong for *excluding* one. `pipeline/universe.py` widens the
-   rules for exclusion; if you touch them, measure **recall**.
-5. **`taker_direction`, not `maker_direction`**, maps to Neuropoly's
-   `direction`. They are exact inverses; the wrong one flips `is_buy` for the
-   whole dataset.
+   rules; if you touch them, measure **recall**.
+5. **`taker_direction`, not `maker_direction`**, maps to `direction`. They are
+   exact inverses; the wrong one flips `is_buy` for the whole dataset.
 6. **Market identity is deliberately excluded from features**
-   (`features.py:403`; `volume` was dropped for the same reason). D3/D4 would
-   partially reverse that, which is why the out-of-sample comparison against
-   the global baseline is not optional.
+   (`features.py:403`; `volume` was dropped for the same reason).
+7. **Batch by rows, not by markets.** Markets differ in size by more than 10×
+   (median 3,939 rows, max 47,754), so a market-count batch is not a memory
+   bound — that is what made `add_labels_streaming` peak at 10.3 GiB.
 
 ## State
 
 - Branch `claude/market-universe-filter`, pushed.
-- `data/market_registry.parquet` — all markets, with `keep` / `exclude_reason`.
-- `data/trades.parquet` — the universe's events, built by `build_trades.py`.
-- **Next: D0** (`census_markets.py`) — the trainability census that decides
-  whether the per-group question is worth pursuing at all.
+- **D0, D1, D2 done.** Per-market, per-family and per-segment models are all
+  ruled out — see the summary table at the top of the docs.
+- `model_d2_8h.txt` — global model, 8 h horizon, test AUC 0.6008.
+- **Running now:** `collect_trades.py` + `paper_trades.py` under `runguard.sh`,
+  measuring live maker fill rates on 42 markets. Needs ~3 days before most
+  markets are scorable.
+
+```bash
+.venv/bin/python paper_trades.py --report --paper-db paper_trades.db
+```
+
+- **Next, ranked:** train on magnitude instead of direction; position sizing;
+  then the fill measurement's verdict. `docs/universe-and-grouping.md` §6 has
+  the full list, including what is already exhausted.
 
 ## Conventions
 
