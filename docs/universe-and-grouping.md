@@ -439,6 +439,55 @@ execution to those puts the backtest at roughly +0.2 % to +0.5 %.
 The next move is therefore an *execution* change, not a modelling one: make the
 live spread a trading precondition, and re-pick the threshold on validation.
 
+## Margin levers tested (2026-09-16)
+
+Same saved model, same split, only the cost model and the entry rule change.
+
+| variant | trades | cost | ROI | Sharpe |
+|---|---|---|---|---|
+| today: taker in, taker out | 7,560 | 3.61 % | −0.32 % | 0.07 |
+| **+ maker exit** | 7,585 | 1.92 % | **+1.69 %** | 0.07 |
+| + only tight books (spread <= 0.005) | 7,592 | 1.62 % | **+1.96 %** | 0.07 |
+| pure maker (theoretical) | 7,669 | 0.00 % | +10.35 % | 0.03 |
+
+**Execution is the lever, not the model.** Exiting as maker instead of crossing
+the spread halves the cost (3.61 % -> 1.92 %) and is the whole difference
+between losing and winning. Nothing on the modelling side came close.
+
+**The pure-maker row is a mirage — do not quote it.** Its extra 84 trades are
+tokens at a median price of 0.0020 whose returns run to +35,489 %; at zero
+assumed cost they stop being filtered out as untradeable and drag the mean from
+3.61 % to 10.35 %. They are lottery tickets with no liquidity behind them.
+
+**The price-band idea backfired**, and the reason is worth keeping: cost is
+`(spread + legs·fee·min(p,1−p))/p`, which is *lowest* near p = 1, not in the
+middle. Restricting to 0.20 ≤ p ≤ 0.80 pushed cost from 3.84 % to 6.26 %. The
+model already picks its trades at a median price of 0.89 — it exploits that
+structure better than a hand-written band does.
+
+### The edge is thin and tail-carried
+
+At the +1.69 % configuration:
+
+| | |
+|---|---|
+| ROI | +1.69 % |
+| without the best 1 / 5 / 10 trades | +1.39 % / +0.91 % / +0.41 % |
+| **without the best 50 of 7,585** | **−1.31 %** |
+| median PnL per trade | **−0.16 %** |
+| share of trades in profit | **44.3 %** |
+| bootstrap 95 % CI | +0.64 % … +2.91 % |
+
+The interval excludes zero, so this is not noise. But the median trade *loses*,
+fewer than half are winners, and removing 0.7 % of the trades flips the sign.
+Sharpe is 0.07. This is a lottery-shaped payoff, not a steady edge — and it
+means position sizing and fill assumptions matter more than another feature.
+
+That also explains where to look next: the model is trained on **direction**
+(`win` is binary at a 0.001 move) while the money is entirely in the **tail**.
+Targeting magnitude directly is the one modelling change with a mechanism
+behind it.
+
 ## The diagnostic (remaining stages)
 
 Five stages, each may stop the next. **Blocked on `processed/trades.csv`**,
