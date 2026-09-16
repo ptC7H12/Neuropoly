@@ -155,6 +155,74 @@ are 100 % trainable and worth hundreds of millions each.
 D1 should therefore compare `other` against `politics`, and consider coarse
 volume/depth strata, not families.
 
+## D1 result (2026-09-16) — and what it settles
+
+`sweep_horizon.py` on `data/trades_trainable.parquet` (8,767 markets), six
+horizons, `--by-segment`. Cost model at the default `spread_abs=0.01`.
+
+| Horizon | Labeled | MedianRet | MedianCost | Ret>Cost | MaxROI* |
+|---|---|---|---|---|---|
+| 30 min | 890,386 | 0.329 % | 8.82 % | **17.38 %** | +37.90 % |
+| 1 h | 851,684 | 0.484 % | 8.67 % | 21.56 % | +43.53 % |
+| 2 h | 803,323 | 0.689 % | 8.36 % | 26.41 % | +45.39 % |
+| 4 h | 740,424 | 0.924 % | 7.62 % | 30.89 % | +48.40 % |
+| 8 h | 677,677 | 1.149 % | 6.75 % | 36.50 % | +58.13 % |
+| **1 d** | 602,561 | 1.818 % | 5.16 % | **47.93 %** | +65.23 % |
+
+### The finding that is not about grouping at all
+
+`Ret>Cost` rises monotonically with the horizon, from 17.4 % to 47.9 %, and
+`MedianCost` falls from 8.82 % to 5.16 %. **`LabelConfig.forward_window_buckets`
+defaults to 6 — 30 minutes — which is the worst horizon tested.** Moving to a
+day nearly triples the share of buckets whose move pays for the round trip.
+
+Longer horizons also select for the deeper markets, which is why cost falls:
+a market that survives 288 buckets is a liquid one.
+
+### By segment
+
+| | politics 30 min | other 30 min | politics 1 d | other 1 d |
+|---|---|---|---|---|
+| Labeled | 233,667 | 656,719 | 182,344 | 420,217 |
+| MedianRet | 0.947 % | 0.592 % | 5.000 % | 2.992 % |
+| MedianCost | 8.41 % | 9.06 % | 5.64 % | 5.97 % |
+| Ret>Cost | 12.27 % | 19.19 % | **48.88 %** | **47.52 %** |
+
+`politics` carries a lower median cost at every horizon, as expected — its
+volume sits in a few deep geopolitical markets. Its median return is also
+~60 % higher throughout.
+
+**At the horizon worth trading, the two segments are indistinguishable**:
+`Ret>Cost` 48.88 % against 47.52 % (2.8 % relative), `MedianCost` 5.64 %
+against 5.97 %. They diverge only at 30 minutes — a horizon the table above
+rules out anyway.
+
+Note the apparent paradox at 30 min: politics has both a *higher* median
+return and a *lower* median cost, yet a *lower* `Ret>Cost`. Medians are taken
+over different buckets, so the two do not compose; politics must carry a more
+skewed return distribution, with more buckets sitting below their own
+individually higher cost. Worth understanding before leaning on the segment
+split for anything.
+
+### Verdict: the grouping question is closed
+
+Per the stopping rule, `Ret>Cost` and `MedianCost` do **not** differ materially
+between segments at the viable horizon. Combined with D0 — which showed no
+family has enough trainable markets to carry a model — the ladder collapses:
+
+* **L3 per market** — dead (D0: median 3 active buckets).
+* **L2 per family** — dead (D0: largest trainable family has 111 markets,
+  45.7 % are singletons).
+* **L1 per segment** — not warranted (D1: the segments converge at 1 d).
+* **L0 one global model** — what remains.
+
+D2 and D4 are therefore moot. **D3** — `segment` as a categorical feature in
+one model — stays worth the ~15 lines, since it costs no data fragmentation
+and lets LightGBM use the split if it helps at all.
+
+The open work is no longer *which grouping* but **the label horizon**, which
+D1 turned up on the way past.
+
 ## The diagnostic (remaining stages)
 
 Five stages, each may stop the next. **Blocked on `processed/trades.csv`**,
