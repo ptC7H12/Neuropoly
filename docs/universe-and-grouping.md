@@ -401,10 +401,28 @@ asserts uniqueness before writing.
 
 **Ranked by expected value, from the levers actually tested.**
 
-1. **Train on magnitude, not direction.** `win` scores a 0.001 move the same as
-   a 0.05 move, so the model optimises direction while the money is in the
-   tail. A regression on `trade_return` targets what pays. This is the one
-   modelling change with a mechanism behind it.
+1. ~~**Train on magnitude, not direction.**~~ **Measured 2026-09-16 — it
+   fails, and the reason closes the whole avenue.** Weighting each training row
+   by `|trade_return|` was the cheap gate before committing to a regression.
+   Five variants (abs, sqrt, clipped at p95, and two netting the row's own
+   round-trip cost) all behave identically: worse AUC, spectacular apparent
+   ROI, collapse under the robustness check. sqrt gives +49.47 % on validation,
+   +7.25 % without its best ten trades, **−14.83 % without its best fifty**, and
+   a losing median trade.
+
+   The median entry price is the tell: the unweighted model trades at **0.94**,
+   every weighted variant at **0.037–0.17**. At price p a one-tick move is a
+   `tick/p` percentage move, so percentage returns explode mechanically as p
+   falls — while cost scales with `1/p` at the same time. **Weighting by
+   percentage return is weighting by 1/price.** Netting the cost does not help,
+   because the cost is the same order of magnitude as the return.
+
+   Two consequences. The unweighted model settling at 0.94 is not a limitation
+   to correct; it is the only regime where movement per unit of cost is cheap.
+   And **a regression on `trade_return` would inherit exactly this**, because
+   `trade_return` is a percentage return — so that rebuild is not worth its
+   cost. Reproduce with `weight_mode` in `pipeline/model.py`; `"none"` is
+   verified to give the current model exactly (test AUC 0.6008).
 2. **Position sizing.** With a lottery-shaped payoff, sizing decides more than
    the signal. Kelly on a fat-tailed distribution is dangerous and is currently
    on by default.
