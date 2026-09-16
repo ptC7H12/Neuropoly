@@ -223,6 +223,66 @@ and lets LightGBM use the split if it helps at all.
 The open work is no longer *which grouping* but **the label horizon**, which
 D1 turned up on the way past.
 
+## D1 result (2026-09-16) — the horizon matters more than the grouping
+
+`sweep_horizon.py` over the 8,767 trainable markets, six horizons, by segment.
+Costs at the default `spread_abs = 0.01`.
+
+| Horizon | Labeled | MedianRet | MedianCost | Ret>Cost | MaxROI* |
+|---|---|---|---|---|---|
+| 30 min | 890,386 | 0.329 % | 8.82 % | 17.38 % | +37.90 % |
+| 1 h | 851,684 | 0.484 % | 8.67 % | 21.56 % | +43.53 % |
+| 2 h | 803,323 | 0.689 % | 8.36 % | 26.41 % | +45.39 % |
+| 4 h | 740,424 | 0.924 % | 7.62 % | 30.89 % | +48.40 % |
+| 8 h | 677,677 | 1.149 % | 6.75 % | 36.50 % | +58.13 % |
+| **1 d** | 602,561 | 1.818 % | 5.16 % | **47.93 %** | +65.23 % |
+
+**The headline is not the segment split, it is the holding period.** `Ret>Cost`
+nearly triples from 30 minutes to a day, while the config default
+(`forward_window_buckets = 6`) sits on the weakest row in the table. Returns
+grow with the horizon and costs shrink, because a longer hold reaches deeper,
+better-priced buckets.
+
+For scale: the example table in `README.md` shows 0.36 % at 30 minutes. This
+universe gives 17.38 % at the same horizon — the filtering work is what bought
+that, and it is the clearest validation of it so far.
+
+### Segments differ at short horizons and converge at long ones
+
+| Horizon | politics Ret>Cost | other Ret>Cost | politics MedianCost | other MedianCost |
+|---|---|---|---|---|
+| 30 min | 12.27 % | 19.19 % | 8.41 % | 9.06 % |
+| 4 h | 27.47 % | 32.23 % | 7.25 % | 7.90 % |
+| 1 d | 48.88 % | 47.52 % | 5.64 % | 5.97 % |
+
+A paradox worth understanding before acting on it: `politics` has a **higher**
+median return *and* **lower** median cost at every horizon, yet a **worse**
+`Ret>Cost` everywhere except one day. `Ret>Cost` pairs each bucket's return
+against that same bucket's cost, so distribution shape decides it, not the
+medians.
+
+Measured explanation: **45.0 %** of politics trades happen at extreme prices
+(below 0.10 or above 0.90) against **36.0 %** for `other`. Cost scales with
+`1/price`, so on the cheap side the politics p90 round-trip is **119.1 %** of
+the position value — the trade costs more than it can pay — against 84.9 % for
+`other`.
+
+### Verdict
+
+`MedianCost` differs by at most 0.7 pp between segments, and `Ret>Cost`
+converges by one day. Against the stopping rule that is not enough to justify
+separate models, and `politics` carries only ~25 % of labels, so splitting
+would starve it. **Go to D3: `segment` as a categorical feature in one model.**
+
+But do the horizon first. Moving `forward_window_buckets` from 6 towards 96-288
+is a larger lever than any grouping decision in this document, and it is a
+one-line config change.
+
+**Caveat that governs all of the above:** `spread_abs = 0.01` is the single
+empirical input and the quartiles across 120 live order books are
+0.001 / 0.010 / 0.039. Re-run with the value actually seen in the markets to be
+traded before treating any of these numbers as final.
+
 ## The diagnostic (remaining stages)
 
 Five stages, each may stop the next. **Blocked on `processed/trades.csv`**,
