@@ -161,10 +161,46 @@ poly_data v2 (`/root/poly_data`, fork of `warproxxx/poly_data`) produces
 Neuropoly's `convert_to_parquet.py` still expects poly_data **v1** and is
 superseded by `build_registry.py` — it is deliberately *not* repaired.
 
-### Trades mapping
+### Trades: read the raw events, not poly_data's stage 3
 
-Feed `processed/trades.csv`, not the raw files. Configurable in
-`config.py` except `market_id`:
+**This reverses the earlier recommendation in this document, on measurement.**
+The split is now: poly_data collects, Neuropoly joins, filters and trains.
+`run_pipeline.sh` defaults to `PIPELINE_STAGES=collect` (markets + chain only)
+and `build_trades.py` here does the rest.
+
+Two independent reasons, both measured:
+
+* **Size.** orderFilled.csv is ~163 GB (~640 M rows). `processed/trades.csv`
+  adds a 66-char hex `market_id` and an ISO timestamp per row, landing near
+  ~195 GB against 270 GB free — and ~73 % of it would be discarded here.
+* **Memory.** `process_live._discover_missing_tokens()` runs *before* the
+  chunked loop and ignores `PROCESS_CHUNK_SIZE`: two `.unique().collect()`
+  passes over the whole file, then Python sets of 77-char strings. It tripped
+  the RAM watchdog on 2026-09-16 and stopped collection for ten hours.
+
+`build_trades.py` joins against the registry with `how="inner"`, so the
+universe filter applies *during* the scan. Measured on the first 2 M events:
+**122,309 rows survive — 6.1 %, a 16x reduction**, far better than the 27 %
+market-count share suggests, because the excluded candle instruments are
+hyperactive.
+
+Two open questions from earlier are now closed:
+
+* **Gamma backfill loss: 0 %.** Not one event in 2 M referenced a token absent
+  from the whole registry. `build_trades.py --count-unmatched` re-measures it.
+* **No dedup needed.** `convert_to_parquet.py` assumes "each trade appears
+  TWICE"; that is false for v2. Every event carries exactly one USDC leg
+  (1,736,203 maker-side + 263,797 taker-side = 2,000,000), and only 1.2 % of
+  output rows repeat exactly — genuine partial fills at one price in one
+  transaction, not duplicated legs.
+
+The column mapping below still describes `processed/trades.csv`, kept for the
+case where `PIPELINE_STAGES=full` is used. `build_trades.py` emits the stock
+`config.py` column names directly, so no mapping is needed on that path.
+
+### Column mapping for processed/trades.csv (legacy path)
+
+Configurable in `config.py` except `market_id`:
 
 | poly_data | Neuropoly | How |
 |---|---|---|
