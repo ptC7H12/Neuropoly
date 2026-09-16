@@ -533,6 +533,54 @@ the slippage directly, instead of sweeping assumptions about them.
 answered; what is left are execution parameters, and they are cheaper to
 measure than to model.
 
+## Live fill measurement running (2026-09-16)
+
+`paper_trades.py` now records the live book at decision time and the price of a
+resting exit one full spread away, then scans every print between entry and due
+to see whether that limit would have filled. `collect_trades.py` feeds it.
+Both run under `runguard.sh`.
+
+The measured fill rate is deliberately an **upper bound**: queue position is not
+modelled, so a print at the limit price may have filled someone ahead. If the
+edge fails at this optimistic reading it was never there.
+
+### Selecting the markets exposed a bigger problem than the spread
+
+The first selection sorted by lifetime volume and was wrong — only 1 of 19
+markets had enough history to score. Lifetime volume is not current activity.
+
+Corrected criterion (tight book *and* recently active) leaves **42 markets** out
+of 8,767 trainable ones. And the reason is not a trade-off between the two:
+
+| spread band | markets | median active buckets / 7 days | share reaching 54 |
+|---|---|---|---|
+| ≤ 0.002 | 151 | 9 | 20 % |
+| 0.002–0.005 | 111 | 13 | 11 % |
+| 0.005–0.010 | 585 | 12 | 19 % |
+| 0.010–0.030 | 490 | 9 | 11 % |
+| > 0.030 | 348 | 7 | 9 % |
+
+Correlation between log(spread) and log(activity) is **−0.105** — tight books
+are not systematically thinner. **Everything is thin.** The median market in
+every band trades in 7–13 five-minute buckets *per week*.
+
+### What that costs the live path
+
+The model needs 48 buckets of feature history plus the label window. At the
+median of the selected 42 markets — 127 active buckets per week, 1.5 per hour —
+a market takes about **three days of collection** before it can be scored at
+all. In the first run the paper trader skipped markets because the most recent
+bucket was 127 and 172 minutes old.
+
+This is a different constraint from everything measured so far. The backtest
+counts a market as trainable if it accumulated 54 active buckets over its
+*lifetime*; live scoring needs them inside a moving window. **A strategy that
+looks tradable on history can have almost no moments where it is actually
+actionable.**
+
+The opportunity count, not the per-trade margin, may turn out to be the binding
+limit — and that is now being measured rather than assumed.
+
 ## The diagnostic (remaining stages)
 
 Five stages, each may stop the next. **Blocked on `processed/trades.csv`**,
