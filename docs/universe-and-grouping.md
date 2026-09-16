@@ -332,6 +332,53 @@ Two consequences worth acting on before more modelling:
    cannot fix this on its own. A magnitude-aware label — or a regression on
    `trade_return` — addresses it directly.
 
+## D2 result (2026-09-16) — the grouping question is answered
+
+One model, one split, one set of cut times, scored separately per segment.
+8-hour horizon (`forward_window_buckets = 96`), 555,526 labeled rows, split
+387,380 train / 82,461 val / 83,332 test. Global test ROC AUC 0.6008.
+
+| segment | rows | AUC | Brier | WinRate | Profit% | ROI | Sharpe | trades |
+|---|---|---|---|---|---|---|---|---|
+| other | 66,462 | 0.6027 | 0.241 | 66.3 % | 27.9 % | −1.4 % | 0.08 | 11,855 |
+| politics | 16,870 | 0.5933 | 0.244 | 63.1 % | 25.8 % | −2.0 % | 0.06 | 2,897 |
+
+**The AUC gap is 0.0094.** Against the stopping rule that is as flat as it
+gets: the two segments are equally predictable, so separate models are not
+justified — and D3 has little to gain either, since there is no group-specific
+structure for a categorical feature to expose.
+
+### The original question, closed
+
+| Granularity | Verdict | Why |
+|---|---|---|
+| per market | impossible | D0: median 3 active buckets; 8,767 of 155,081 trainable |
+| per family | impossible | D0: no trainable family reaches 1000 markets, largest is 111, 45.7 % singletons |
+| per segment | not justified | D2: AUC 0.6027 vs 0.5933 |
+| **global** | **use this** | — |
+
+### The finding that matters more
+
+Both segments show **negative ROI** while the model plainly has signal: AUC
+0.60 out of sample with time-purged splits, and a win rate of 66.3 %.
+
+Win rate 66.3 % against **27.9 % profitable** is exactly the gap `README.md`
+warns about. The model gets the direction right two times in three, and the
+moves are still too small to clear a ~7 % round trip. Direction is not the
+problem; magnitude is.
+
+Levers, in measured order of size:
+
+1. **Horizon.** D1: `Ret>Cost` is 36.5 % at 8 h and 47.9 % at one day. This
+   run sits at 8 h. One config line.
+2. **Entry threshold.** 0.6 today. Higher means fewer, higher-conviction
+   buckets — which is the right direction when the binding constraint is that
+   the average qualifying move is too small.
+3. **`spread_abs`.** Set to 0.01, the median across 120 live order books, but
+   the quartiles are 0.001 / 0.010 / 0.039. At the lower quartile the cost
+   model changes shape entirely. This is an assumption, not a measurement of
+   the markets actually traded, and it deserves to become one.
+
 ## The diagnostic (remaining stages)
 
 Five stages, each may stop the next. **Blocked on `processed/trades.csv`**,
