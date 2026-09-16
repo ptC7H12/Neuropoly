@@ -96,6 +96,41 @@ These have all bitten. None of them raise.
   then the fill measurement's verdict. `docs/universe-and-grouping.md` §6 has
   the full list, including what is already exhausted.
 
+## Keep the documentation current — and ask before changing it
+
+**When a finding is verified or a workflow changes, propose a documentation
+update in the same breath, and get agreement before writing it.** Do not update
+silently, and do not leave it for later.
+
+*Verified* means measured and reproducible: a number that came out of a run, a
+behaviour confirmed against the real data, a procedure that was actually
+executed. Not a hunch, not a plausible explanation, not something that "should"
+be true. Unverified things belong in the open-questions section, marked as such.
+
+Where each kind of thing goes:
+
+| finding | goes to |
+|---|---|
+| a measurement, a verdict, a closed question | `docs/universe-and-grouping.md` |
+| an invariant that breaks quietly, a command, current state | `CLAUDE.md` |
+| a changed data path or tool a user would run | `README.md` |
+| something a future session must not re-derive | the memory files |
+
+Two habits that follow from how this went wrong before:
+
+* **Edit in place, do not append.** `docs/universe-and-grouping.md` once grew to
+  two "D1 result" sections and two "D2 result" sections, one of each pair
+  contradicting the other, plus a "remaining stages" list describing work that
+  was already finished. A document that disagrees with itself is worse than one
+  that is merely out of date.
+* **Re-check every claim against the repo before writing it.** Test counts,
+  file paths, line references and running processes all drift. Verify, then
+  write.
+
+When a result overturns something already written — including a recommendation
+made earlier in the same session — say so explicitly and record the reason. The
+reversal is usually the most useful part.
+
 ## Conventions
 
 - Tests use **real slugs** from the export, never invented ones — a made-up
