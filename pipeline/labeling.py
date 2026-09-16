@@ -219,6 +219,7 @@ def add_labels_streaming(
     cfg: LabelConfig,
     output_path: str = "labeled.parquet",
     batch_markets: int = 100,
+    max_batch_rows: int = 500_000,
 ) -> str:
     """
     Add win / future_return / trade_return labels from a features Parquet
@@ -226,8 +227,11 @@ def add_labels_streaming(
 
     Every label expression is market-aware (shift(-N).over("market_id") or
     row-wise), so a batch yields exactly the same values as one market at a
-    time while amortising Polars' per-call overhead.  Peak RAM is
-    `batch_markets` markets' rows; pass 1 to process strictly one at a time.
+    time while amortising Polars' per-call overhead.
+
+    A batch ends at whichever limit comes first: `batch_markets` markets or
+    `max_batch_rows` rows.  The row cap is what actually bounds memory —
+    markets vary in size by more than 10x, so a market count alone does not.
 
     Returns the output file path.
     """
@@ -238,9 +242,36 @@ def add_labels_streaming(
     n_rg = pf.metadata.num_row_groups
     writer = None
     batch_markets = max(1, batch_markets)
+    md = pf.metadata
 
-    for batch_start in range(0, n_rg, batch_markets):
-        group_ids = list(range(batch_start, min(batch_start + batch_markets, n_rg)))
+    # Batches are capped by ROW count, not just market count.
+    #
+    # Markets differ in size by more than an order of magnitude — measured on
+    # a real features file: median 3,939 rows per market, p99 40,490, max
+    # 47,754.  A fixed market count is therefore an unstable unit: the worst
+    # 100-market batch held 4,064,925 rows, which is 3.1 GiB of raw values at
+    # 101 columns before Polars builds a single intermediate for the shift and
+    # over expressions.  On 2026-09-16 that peaked at 10.3 GiB and had to be
+    # killed.
+    #
+    # Row groups are read in file order and cut as soon as the accumulated row
+    # count would exceed the cap, so one oversized market still forms its own
+    # batch and peak RAM stays bounded by the cap rather than by which markets
+    # happen to sit next to each other.
+    def _batches() -> "list[list[int]]":
+        out, cur, cur_rows = [], [], 0
+        for i in range(n_rg):
+            rows = md.row_group(i).num_rows
+            if cur and (cur_rows + rows > max_batch_rows or len(cur) >= batch_markets):
+                out.append(cur)
+                cur, cur_rows = [], 0
+            cur.append(i)
+            cur_rows += rows
+        if cur:
+            out.append(cur)
+        return out
+
+    for group_ids in _batches():
         batch_df = pl.from_arrow(pf.read_row_groups(group_ids))
 
         labeled_df = add_labels(batch_df, cfg)

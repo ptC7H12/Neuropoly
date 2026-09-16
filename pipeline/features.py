@@ -459,18 +459,35 @@ def report_degenerate_features(
     if not present:
         return {"all_null": [], "constant": []}
 
+    # Constant is tested as min == max, not with n_unique().
+    #
+    # n_unique() builds a hash set of every distinct value per column. Over 91
+    # mostly-continuous float columns and 81.6 M labeled rows that is tens of
+    # gigabytes, in a plain collect() with no streaming — on 2026-09-16 this
+    # diagnostic, not the training, is what pushed MemAvailable from 15.4 to
+    # 4.4 GiB in six seconds and took the host down with it.
+    #
+    # min/max answer the same question exactly and in constant memory: a
+    # column holds one distinct non-null value precisely when its minimum
+    # equals its maximum.
     stats = lf.select(
         [pl.col(c).null_count().alias(f"{c}__nulls") for c in present]
-        + [pl.col(c).n_unique().alias(f"{c}__uniq") for c in present]
+        + [pl.col(c).min().alias(f"{c}__min") for c in present]
+        + [pl.col(c).max().alias(f"{c}__max") for c in present]
         + [pl.len().alias("__n")]
-    ).collect()
+    ).collect(engine="streaming")
 
     n = int(stats["__n"][0])
     all_null, constant = [], []
     for c in present:
         if int(stats[f"{c}__nulls"][0]) == n:
             all_null.append(c)
-        elif int(stats[f"{c}__uniq"][0]) <= 1:
+            continue
+        lo, hi = stats[f"{c}__min"][0], stats[f"{c}__max"][0]
+        # NaN compares unequal to itself, so an all-NaN column is reported as
+        # varying rather than constant. That is the safe direction: it keeps a
+        # real column out of the "dead weight" list on a technicality.
+        if lo is not None and hi is not None and lo == hi:
             constant.append(c)
 
     if all_null or constant:

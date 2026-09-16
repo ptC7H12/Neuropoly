@@ -11,12 +11,22 @@ per-group models are worth building. It is written to be picked up cold.
 ## Where the data comes from
 
 `/root/poly_data` — a fork of `warproxxx/poly_data` **v2**, running on this
-same box. It writes `data/markets.csv`, `data/orderFilled.csv` (~160 GB) and
-`processed/trades.csv`. The two repos are a chain but neither README says so.
+same box. **It collects; this repo joins, filters and trains.** It runs with
+`PIPELINE_STAGES=collect` (markets + chain), so `processed/trades.csv` is not
+produced — see `docs/universe-and-grouping.md` for the measurements behind
+that split.
 
-- `build_registry.py` is the bridge. Run it after poly_data appends markets.
-- `convert_to_parquet.py` still targets poly_data **v1** and is superseded.
-  Do not repair it; it fails silently (writes an empty `trades.parquet`).
+The two-step bridge, in order:
+
+1. `build_registry.py` — `markets.csv` -> `data/market_registry.parquet`.
+   Re-run after poly_data appends markets; ids stay stable.
+2. `build_trades.py` — `orderFilled.csv` -> `data/trades.parquet`, joined
+   against the registry and filtered to the universe *during* the scan. That
+   filter is a 16x reduction at event level, not the 3.7x the market counts
+   suggest, because the excluded candle instruments are hyperactive.
+
+`convert_to_parquet.py` targets poly_data **v1** and is superseded by both.
+Do not repair it; it fails silently (writes an empty `trades.parquet`).
 
 ## Environment
 
@@ -58,10 +68,11 @@ These have all bitten already. None of them raise.
 
 ## State
 
-- Branch `claude/market-universe-filter`: registry + universe filter, committed.
+- Branch `claude/market-universe-filter`, pushed.
 - `data/market_registry.parquet` — all markets, with `keep` / `exclude_reason`.
-- **Next: D0** (`census_markets.py`), blocked on `processed/trades.csv`, which
-  poly_data's stage 3 has not produced yet.
+- `data/trades.parquet` — the universe's events, built by `build_trades.py`.
+- **Next: D0** (`census_markets.py`) — the trainability census that decides
+  whether the per-group question is worth pursuing at all.
 
 ## Conventions
 
