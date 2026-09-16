@@ -45,6 +45,14 @@ class SplitResult:
     val_price: np.ndarray | None = None
     test_price: np.ndarray | None = None
 
+    # market_id per row, aligned with *_y.  Without this a global model's
+    # error cannot be decomposed by group after the fact — the arrays leave
+    # here as anonymous floats — and that decomposition is the honest
+    # baseline any per-group model has to beat.
+    train_mid: np.ndarray | None = None
+    val_mid: np.ndarray | None = None
+    test_mid: np.ndarray | None = None
+
     # Time boundaries for reference
     train_end: object = None
     val_start: object = None
@@ -175,6 +183,11 @@ def walk_forward_split(
     def _y(part: pl.DataFrame) -> np.ndarray:
         return part["win"].to_numpy().astype(np.float32)
 
+    def _mid(part: pl.DataFrame) -> np.ndarray | None:
+        if "market_id" not in part.columns:
+            return None
+        return part["market_id"].to_numpy()
+
     def _col(part: pl.DataFrame, name: str) -> np.ndarray | None:
         if name not in part.columns:
             return None
@@ -194,6 +207,9 @@ def walk_forward_split(
         train_price=_col(train_df, "entry_token_price"),
         val_price=_col(val_df, "entry_token_price"),
         test_price=_col(test_df, "entry_token_price"),
+        train_mid=_mid(train_df),
+        val_mid=_mid(val_df),
+        test_mid=_mid(test_df),
         train_end=train_df["bucket_time"].max(),
         val_start=val_df["bucket_time"].min(),
         val_end=val_df["bucket_time"].max(),

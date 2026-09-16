@@ -49,6 +49,7 @@ from pipeline.labeling import add_labels, label_stats, add_labels_streaming, lab
 from pipeline.splitter import walk_forward_split, print_split_info
 from pipeline.model import train_model, predict, feature_importance
 from pipeline.evaluation import evaluate, backtest, print_evaluation
+from pipeline.segments import load_segment_map
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,6 +72,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, help="Monitor update interval")
     parser.add_argument("--no-rich", action="store_true", help="Disable rich dashboard")
     parser.add_argument("--dry-run", action="store_true", help="Stats only, no training")
+    parser.add_argument(
+        "--segments", type=str,
+        help="segment map from build_registry.py / classify_markets.py; "
+             "enables --by-segment",
+    )
+    parser.add_argument(
+        "--by-segment", action="store_true",
+        help="D2: decompose the global model's test metrics by segment. "
+             "This is the baseline any per-group model has to beat.",
+    )
     parser.add_argument(
         "--low-memory",
         action="store_true",
@@ -128,6 +139,64 @@ def apply_args(cfg: PipelineConfig, args: argparse.Namespace) -> PipelineConfig:
         print("     - Smaller model (num_leaves=15, max_depth=5)")
 
     return cfg
+
+
+def decompose_by_segment(split, y_pred, cfg, segments_path: str) -> None:
+    """
+    D2 — the same model, scored separately on each segment's test rows.
+
+    Deliberately one model and one split: the cut times, the training data and
+    the trees are identical across segments, so a spread in these numbers is a
+    property of the markets, not of how they were fitted. Training a model per
+    segment and comparing those would confound the two.
+
+    A segment that the global model already serves well needs no model of its
+    own; one it serves badly is the candidate — and the gap measured here is
+    what a separate model would have to beat.
+    """
+    from pipeline.segments import segment_series
+
+    if split.test_mid is None:
+        print("\n  [by-segment] split carries no market_id — skipped")
+        return
+    seg_map = load_segment_map(segments_path)
+    segs = segment_series(split.test_mid.tolist(), seg_map).to_numpy()
+
+    print(f"\n{'=' * 78}")
+    print("  D2 — GLOBAL MODEL, TEST METRICS BY SEGMENT")
+    print(f"{'=' * 78}")
+    print(f"  {'segment':<12}{'rows':>10}{'AUC':>8}{'Brier':>8}{'WinRate':>9}"
+          f"{'Profit%':>9}{'ROI':>9}{'Sharpe':>8}{'trades':>8}")
+    print(f"  {'-' * 76}")
+
+    for name in sorted(set(segs.tolist())):
+        m = segs == name
+        n = int(m.sum())
+        if n < 100:
+            print(f"  {name:<12}{n:>10,}   too few rows to score")
+            continue
+        met = evaluate(split.test_y[m], y_pred[m],
+                       threshold=cfg.backtest.entry_threshold)
+        sub = lambda a: a[m] if a is not None else None
+        bt = backtest(
+            split.test_y[m], y_pred[m],
+            trade_returns=sub(split.test_ret), entry_prices=sub(split.test_price),
+            cost=cfg.backtest.cost, entry_threshold=cfg.backtest.entry_threshold,
+            fee_rate=cfg.backtest.fee_rate,
+            max_position_usd=cfg.backtest.max_position_usd,
+            kelly_sizing=cfg.backtest.kelly_sizing, kelly_cap=cfg.backtest.kelly_cap,
+            initial_bankroll=cfg.backtest.initial_bankroll,
+        )
+        auc = f"{met.roc_auc:.4f}" if met.roc_auc_defined else "  n/a "
+        print(f"  {name:<12}{n:>10,}{auc:>8}{met.brier_score:>8.3f}"
+              f"{bt.win_rate:>8.1%}{bt.profit_rate:>9.1%}{bt.roi:>9.1%}"
+              f"{bt.sharpe_ratio:>8.2f}{bt.total_trades:>8,}")
+
+    print(f"  {'-' * 76}")
+    print("  A wide spread in AUC means the markets differ in how predictable")
+    print("  they are; a narrow one means one model already covers them, and")
+    print("  D3 (segment as a categorical feature) is the cheaper next step")
+    print("  than separate models, which would each see less data.")
 
 
 def main():
@@ -258,6 +327,12 @@ def main():
     )
 
     print_evaluation(metrics, bt)
+
+    if args.by_segment:
+        if not args.segments:
+            print("\n  --by-segment needs --segments PATH")
+        else:
+            decompose_by_segment(split, y_pred, cfg, args.segments)
 
     total_time = time.time() - t0
     print(f"\nPipeline completed in {total_time:.1f}s")
