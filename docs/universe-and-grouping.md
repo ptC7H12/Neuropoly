@@ -379,6 +379,66 @@ Levers, in measured order of size:
    model changes shape entirely. This is an assumption, not a measurement of
    the markets actually traded, and it deserves to become one.
 
+## Spread measured (2026-09-16) — the assumption held, and break-even is close
+
+`measure_spread.py` pulled the live CLOB order book for every still-open
+trainable market: **1,685 books in 12 seconds.** Of 8,767 trainable markets
+1,880 are still open and all of them have a book.
+
+| | n | median | p25 | p75 | p90 |
+|---|---|---|---|---|---|
+| all | 1,685 | **0.0100** | 0.0100 | 0.0300 | 0.0600 |
+| other | 1,264 | 0.0110 | 0.0100 | 0.0300 | 0.0770 |
+| politics | 421 | 0.0100 | 0.0090 | 0.0270 | 0.0470 |
+
+Volume-weighted: **0.0083**. The 0.01 assumption every earlier number used was
+right, so the hoped-for escape — "maybe our markets are far tighter" — is
+closed. Note also that 1,192 of these markets have a 0.01 tick size, so for
+them 0.01 is the *floor*, not an average.
+
+### What that does to the ROI
+
+The saved model re-scored at different spreads and entry thresholds — no
+retraining, same split, same trees:
+
+| spread \ threshold | 0.60 | 0.63 | **0.65** | 0.68 | 0.70 |
+|---|---|---|---|---|---|
+| 0.0100 (assumed) | −1.55 % | −0.99 % | −0.64 % | −1.31 % | −1.70 % |
+| **0.0083 (measured)** | −1.11 % | −0.57 % | **−0.23 %** | −0.88 % | −1.42 % |
+| 0.0060 | −0.60 % | −0.12 % | **+0.17 %** | −0.53 % | −1.13 % |
+| 0.0040 | −0.17 % | +0.29 % | **+0.50 %** | −0.28 % | −0.91 % |
+| 0.0030 | +0.09 % | +0.50 % | **+0.69 %** | −0.11 % | −0.76 % |
+
+Two independent levers, and both matter:
+
+* **Entry threshold 0.65 is the optimum at every spread.** Below it, too many
+  marginal trades; above it, the realised return collapses (1.44 % at 0.70,
+  negative at 0.75) faster than the cost falls. At 0.65 the model trades 7,585
+  times instead of 14,759 and the mean cost drops from 5.00 % to 3.84 %,
+  because its confident picks sit in higher-priced tokens that are cheaper to
+  trade.
+* **Break-even in spread sits near 0.007.** Measured median is 0.0100 and
+  volume-weighted 0.0083, so the gap is roughly a factor of 1.2-1.4 — not the
+  factor of 10 that would need a different market.
+
+**And the tight markets exist.** 262 of the 1,685 books (15.5 %) quote a spread
+of 0.005 or less, and they carry 165.4 M USD of the volume. Restricting
+execution to those puts the backtest at roughly +0.2 % to +0.5 %.
+
+### Caveats that matter more than the numbers
+
+* **The threshold was read off the test split.** Picking 0.65 by looking at
+  test ROI is selection on the evaluation set. It has to be chosen on the
+  validation split before any of these figures can be claimed out-of-sample.
+* **+0.5 % ROI is thin.** It is not zero and it is not a business either; it
+  leaves no room for slippage beyond the top of book, and depth was recorded
+  but not yet used.
+* **Fees alone cost about 3 %** of the position at threshold 0.65. That is the
+  floor no execution improvement can go below.
+
+The next move is therefore an *execution* change, not a modelling one: make the
+live spread a trading precondition, and re-pick the threshold on validation.
+
 ## The diagnostic (remaining stages)
 
 Five stages, each may stop the next. **Blocked on `processed/trades.csv`**,
