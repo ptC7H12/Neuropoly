@@ -104,7 +104,58 @@ Largest surviving families: `elon-musk-of-tweets` (4,766), then weather —
 `highest-temperature-in-{seattle,london,dallas,atlanta,nyc,...}-on` (~2,400-2,650
 each). Weather is ~14 % of the universe.
 
-## The diagnostic (not yet built)
+## D0 result (2026-09-16) — and what it settles
+
+`census_markets.py`, run on 33,042,239 events across 155,081 markets that
+actually traded.
+
+**Trainable: 8,767 markets — 5.7 % of those that traded, but 88.6 % of USD
+volume.** The shallow markets are numerous and economically irrelevant. Volume
+is the headline number precisely because market counts mislead here.
+
+Verdict against the stopping rule: 88.6 % >> 20 %, so the feature architecture
+is *not* the constraint. Proceed.
+
+Measuring `active` and `span` separately was what made this honest. 70,177
+markets (45.3 %) have a calendar span of >= 54 buckets, but only 8,767 have 54
+buckets that really traded — an 8x overstatement if only span were counted.
+Median active buckets per market is **3**.
+
+Upper bound on feature rows: **2,182,160**.
+
+### This kills the per-family idea
+
+Family structure *within the trainable subset* is nothing like the universe:
+
+| Family size | Families | Markets | Share | Volume |
+|---|---|---|---|---|
+| >= 1000 | **0** | 0 | 0.0 % | — |
+| 100-999 | 1 | 111 | 1.3 % | 0.00B |
+| 10-99 | 83 | 1,445 | 16.5 % | 1.04B |
+| 2-9 | 1,023 | 3,202 | 36.5 % | 1.14B |
+| singleton | 4,009 | 4,009 | 45.7 % | 0.92B |
+
+The 60 families with >= 1000 members counted earlier were the candle-like
+shallow markets — exactly the ones that are not trainable. The largest
+trainable family is `will-donald-trump-publicly-insult-someone-on`, with 111
+markets; 45.7 % are one-offs.
+
+**So there is no family with enough trainable markets to carry its own model**
+with a walk-forward split that has a non-empty val and test. D4 (models per
+family) is off the table, and `family` as a categorical feature over 5,116
+levels — half of them singletons — would be an overfitting surface, not a
+signal.
+
+What remains as a grouping axis is `segment`, and in this universe that is two
+values: `other` (150,552 markets, 2.44B, 83.8 % of its volume trainable) and
+`politics` (4,529 markets, 1.08B, **99.4 %**). Volume is concentrated in
+geopolitical event markets — Iran/US, Russia/Ukraine, Strait of Hormuz — which
+are 100 % trainable and worth hundreds of millions each.
+
+D1 should therefore compare `other` against `politics`, and consider coarse
+volume/depth strata, not families.
+
+## The diagnostic (remaining stages)
 
 Five stages, each may stop the next. **Blocked on `processed/trades.csv`**,
 which poly_data's stage 3 has not yet produced.
