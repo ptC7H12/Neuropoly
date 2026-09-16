@@ -488,6 +488,51 @@ That also explains where to look next: the model is trained on **direction**
 Targeting magnitude directly is the one modelling change with a mechanism
 behind it.
 
+## Does the maker edge survive adverse selection? (2026-09-16)
+
+The +1.69 % above assumed every maker exit fills. A resting limit only fills
+when someone crosses to it, which happens disproportionately when the price is
+moving against you — so the assumption had to be tested before anything is
+built on it.
+
+**Fill pattern alone does not break it.** Even at the extreme — never filling
+on a winner, always filling on a loser — ROI stays at +0.32 %, above the
+−0.32 % taker baseline. The reason is structural: the cost saving (half the
+spread, one fee leg) applies to whichever trades fill *regardless of how they
+turn out*. Adverse selection decides who gets the discount, not whether the
+discount exists.
+
+**What can break it is the price penalty for a missed fill**, which the first
+model ignored: a limit that never fills means exiting later and worse, not
+exiting at the same price for more cost.
+
+| penalty on unfilled exits | × spread | ROI (winners fill) | ROI (only losers fill) |
+|---|---|---|---|
+| 0.0000 | 0× | +0.85 % | +0.32 % |
+| 0.0020 | 0.2× | +0.74 % | +0.08 % |
+| 0.0050 | 0.6× | +0.57 % | −0.28 % |
+| 0.0083 | 1.0× | +0.38 % | −0.67 % |
+| 0.0150 | 1.8× | 0.00 % | −1.47 % |
+
+Break-even against the taker baseline: **2.5× the spread** if winners fill,
+**0.6× the spread** in the hostile case.
+
+### The decision now rests on one unmeasured number
+
+How much worse is the exit when the limit does not fill? Below ~0.005 in price
+units the maker route wins under any fill pattern; above ~0.021 it loses under
+every one. In between it depends on which trades fill.
+
+That number cannot be recovered from this dataset — it needs live order-book
+time series, or simply live behaviour. The repo already has the right tool for
+that: `paper_trades.py` logs each decision and checks the outcome after the
+label window. Running it with resting limit exits measures the fill rate and
+the slippage directly, instead of sweeping assumptions about them.
+
+**This mirrors the spread lesson exactly.** The modelling questions are
+answered; what is left are execution parameters, and they are cheaper to
+measure than to model.
+
 ## The diagnostic (remaining stages)
 
 Five stages, each may stop the next. **Blocked on `processed/trades.csv`**,
