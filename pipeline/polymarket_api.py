@@ -219,6 +219,41 @@ def fetch_markets_by_id(
     return out
 
 
+CLOB_API = "https://clob.polymarket.com"
+
+
+def fetch_book(token_id: str, timeout: int = 15) -> Optional[dict]:
+    """
+    Bestes Gebot und beste Nachfrage aus dem Live-Orderbuch.
+
+    Der Spread ist der einzige empirische Eingabewert des Kostenmodells und
+    streut ueber die Maerkte um mehr als eine Groessenordnung (Quartile ueber
+    120 Buecher: 0.001 / 0.010 / 0.039).  Er zur Entscheidungszeit
+    mitzuschreiben ist der Unterschied zwischen einer gemessenen und einer
+    angenommenen Rechnung.
+
+    Gibt None zurueck, wenn eine Seite des Buches leer ist — dann gibt es
+    keinen handelbaren Spread — oder wenn der Endpunkt nicht erreichbar war.
+    Nur `PolymarketAPIError` wird gefangen, nicht alles: ein breites
+    `except Exception` hat hier bereits einen fehlenden Import als "kein Buch"
+    getarnt, was wie ein leeres Orderbuch aussah.
+    """
+    try:
+        b = _get(f"{CLOB_API}/book", params={"token_id": token_id}, timeout=timeout)
+    except PolymarketAPIError:
+        return None            # Netz/Endpunkt weg — der Aufrufer entscheidet
+    bids, asks = b.get("bids") or [], b.get("asks") or []
+    if not bids or not asks:
+        return None
+    bb = max(bids, key=lambda x: float(x["price"]))
+    ba = min(asks, key=lambda x: float(x["price"]))
+    bid, ask = float(bb["price"]), float(ba["price"])
+    return {"bid": bid, "ask": ask, "spread": round(ask - bid, 6),
+            "mid": round((ask + bid) / 2, 6),
+            "bid_size": float(bb.get("size", 0)),
+            "ask_size": float(ba.get("size", 0))}
+
+
 def market_tags(market: dict) -> list[str]:
     """Tag labels of a Gamma market dict, empty if it carries none."""
     return [
